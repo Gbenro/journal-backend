@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import re
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -24,8 +25,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SQLite database file
-DATABASE_FILE = "journal.db"
+# Persistent storage configuration
+def is_railway_environment():
+    """Check if running on Railway"""
+    return bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID") or os.getenv("RAILWAY_DEPLOYMENT_ID"))
+
+def ensure_data_directory():
+    """Ensure data directory exists for persistent storage"""
+    if is_railway_environment():
+        data_dir = "/app/data"
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(f"✅ Data directory ensured: {data_dir}")
+    else:
+        # For local development, ensure current directory is writable
+        logger.info("🏠 Local development mode - using current directory")
+
+def get_database_path():
+    """Get appropriate database path for environment"""
+    if is_railway_environment():
+        return "/app/data/journal.db"
+    else:
+        return "journal.db"
+
+def get_storage_info():
+    """Get storage configuration info"""
+    if is_railway_environment():
+        return {
+            "platform": "Railway",
+            "storage": "Persistent Volume",
+            "path": "/app/data/journal.db",
+            "persistent": True
+        }
+    else:
+        return {
+            "platform": "Local",
+            "storage": "Local File",
+            "path": "journal.db",
+            "persistent": False
+        }
+
+# Get database file path
+DATABASE_FILE = get_database_path()
 
 # Predefined tags data
 PREDEFINED_TAGS = [
@@ -136,19 +176,28 @@ class AutoTagger:
         return auto_tags[:3]  # Limit to 3 auto tags
 
 def get_db_connection():
-    """Get SQLite database connection"""
+    """Get SQLite database connection with persistent path"""
+    ensure_data_directory()
+    db_path = get_database_path()
+    
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row  # Enable dict-like access
         return conn
     except Exception as e:
-        logger.error(f"Database connection failed: {e}")
+        logger.error(f"Database connection failed at {db_path}: {e}")
         raise
 
 def init_database():
-    """Initialize SQLite database with enhanced schema"""
+    """Initialize SQLite database with enhanced schema and persistent storage"""
+    ensure_data_directory()
+    db_path = get_database_path()
+    
+    logger.info(f"🔧 Initializing database at: {db_path}")
+    
     try:
-        conn = get_db_connection()
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         # Create messages table
@@ -189,11 +238,13 @@ def init_database():
             )
         """)
         
-        # Create indexes
+        # Create indexes for performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_timestamp ON messages(user_id, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message ON entry_tags(message_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_tag ON entry_tags(tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_category ON tags(category)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message_id ON entry_tags(message_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_tag_id ON entry_tags(tag_id)")
         
         # Insert predefined tags if they don't exist
         for tag_data in PREDEFINED_TAGS:
@@ -206,11 +257,11 @@ def init_database():
         cursor.close()
         conn.close()
         
-        logger.info("✅ Enhanced SQLite database with tags initialized successfully")
+        logger.info(f"✅ Enhanced SQLite database with tags initialized successfully at: {db_path}")
         return True
         
     except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
+        logger.error(f"❌ Database initialization failed at {db_path}: {e}")
         return False
 
 def get_or_create_tag(conn: sqlite3.Connection, tag_name: str) -> int:
@@ -247,35 +298,81 @@ def apply_tags_to_entry(conn: sqlite3.Connection, message_id: int, tags_data: Li
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup"""
-    logger.info("🚀 Starting up with enhanced SQLite and tags...")
+    """Initialize database on startup with comprehensive logging"""
+    logger.info("🚀 Starting Mirror Scribe Backend with Intelligent Tags...")
+    logger.info(f"📁 Environment: {'Railway' if is_railway_environment() else 'Local'}")
+    logger.info(f"💾 Database path: {get_database_path()}")
+    logger.info(f"📂 Data directory: {'/app/data' if is_railway_environment() else 'local'}")
+    
+    # Initialize database
     success = init_database()
+    
     if success:
-        logger.info("✅ Ready to serve requests with tagging system")
+        # Check existing data
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM messages")
+            message_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM tags")
+            tag_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM entry_tags")
+            tag_applications = cursor.fetchone()[0]
+            conn.close()
+            
+            logger.info(f"📝 Existing journal entries: {message_count}")
+            logger.info(f"🏷️ Available tags: {tag_count}")
+            logger.info(f"🔗 Tag applications: {tag_applications}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check existing data: {e}")
+        
+        logger.info("✅ Mirror Scribe Backend ready with persistent storage!")
     else:
         logger.warning("⚠️ Database initialization failed, but continuing...")
 
 @app.get("/health")
 async def health_check():
-    """Health check with SQLite database test"""
+    """Enhanced health check with persistent storage info"""
     try:
+        db_path = get_database_path()
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Test database connectivity
         cursor.execute("SELECT 1")
         
-        # Check if tags table exists
-        cursor.execute("SELECT COUNT(*) as count FROM tags")
-        tag_count = cursor.fetchone()["count"]
+        # Get comprehensive stats
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        message_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM tags")
+        tag_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM entry_tags")
+        tag_applications = cursor.fetchone()[0]
         
         cursor.close()
         conn.close()
         
+        # Check if database file exists and get size
+        db_exists = os.path.exists(db_path)
+        db_size = os.path.getsize(db_path) if db_exists else 0
+        
         return {
             "status": "healthy",
             "database": "sqlite_connected",
-            "database_file": DATABASE_FILE,
-            "features": ["tagging", "auto_tagging", "search"],
-            "predefined_tags": tag_count,
+            "database_path": db_path,
+            "database_exists": db_exists,
+            "database_size_bytes": db_size,
+            "storage_info": get_storage_info(),
+            "persistent_storage": is_railway_environment(),
+            "data_directory_exists": os.path.exists("/app/data") if is_railway_environment() else True,
+            "features": ["tagging", "auto_tagging", "search", "persistent_storage"],
+            "stats": {
+                "total_entries": message_count,
+                "total_tags": tag_count,
+                "tag_applications": tag_applications
+            },
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
@@ -284,6 +381,8 @@ async def health_check():
             "status": "unhealthy",
             "database": "sqlite_disconnected", 
             "error": str(e),
+            "database_path": get_database_path(),
+            "storage_info": get_storage_info(),
             "timestamp": datetime.utcnow().isoformat()
         }
 
@@ -298,6 +397,66 @@ async def initialize_database():
             raise HTTPException(status_code=503, detail="Database initialization failed")
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database initialization failed: {str(e)}")
+
+@app.get("/storage-info")
+async def get_storage_information():
+    """Get comprehensive storage configuration details"""
+    try:
+        storage_info = get_storage_info()
+        db_path = get_database_path()
+        
+        # Check if database file exists
+        db_exists = os.path.exists(db_path)
+        
+        # Get file size if exists
+        db_size = os.path.getsize(db_path) if db_exists else 0
+        
+        # Check data directory
+        data_dir_exists = True
+        if is_railway_environment():
+            data_dir_exists = os.path.exists("/app/data")
+        
+        # Get database stats if available
+        stats = {"total_entries": 0, "total_tags": 0, "tag_applications": 0}
+        if db_exists:
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM messages")
+                stats["total_entries"] = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM tags")  
+                stats["total_tags"] = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM entry_tags")
+                stats["tag_applications"] = cursor.fetchone()[0]
+                conn.close()
+            except Exception:
+                pass  # Stats are optional
+        
+        return {
+            "storage_config": storage_info,
+            "database_path": db_path,
+            "database_exists": db_exists,
+            "database_size_bytes": db_size,
+            "database_size_mb": round(db_size / (1024 * 1024), 2),
+            "data_directory_exists": data_dir_exists,
+            "environment": {
+                "is_railway": is_railway_environment(),
+                "railway_env": os.getenv("RAILWAY_ENVIRONMENT"),
+                "railway_project": os.getenv("RAILWAY_PROJECT_ID"),
+                "railway_deployment": os.getenv("RAILWAY_DEPLOYMENT_ID")
+            },
+            "persistence_test": {
+                "description": "Database will persist across Railway deployments",
+                "volume_mount": "/app/data" if is_railway_environment() else "N/A",
+                "backup_recommended": True
+            },
+            "database_stats": stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Storage info failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get storage info: {str(e)}")
 
 # Tag management endpoints
 @app.get("/api/tags")
@@ -544,27 +703,37 @@ async def get_messages_by_tags(user_id: str, tag_names: str, limit: int = 100, o
 async def root():
     """Root endpoint with enhanced API information"""
     return {
-        "service": "Journaling Backend with Intelligent Tags",
-        "version": "2.0.0",
-        "database": "SQLite",
+        "service": "Mirror Scribe Backend with Intelligent Tags & Persistent Storage",
+        "version": "2.1.0",
+        "database": "SQLite with Persistent Volume",
+        "storage": get_storage_info(),
         "features": [
             "intelligent_tagging",
             "auto_tag_suggestions", 
             "manual_tags",
             "tag_filtering",
             "category_organization",
-            "keyword_matching"
+            "keyword_matching",
+            "persistent_storage",
+            "railway_optimized"
         ],
         "endpoints": [
             "/health",
+            "/storage-info",
             "/init", 
             "/api/save",
             "/api/messages/{user_id}",
             "/api/messages/{user_id}/tags/{tag_names}",
             "/api/tags",
             "/api/tags/categories",
-            "/api/tags/suggestions"
+            "/api/tags/suggestions",
+            "/stats"
         ],
+        "persistence": {
+            "description": "All data persists across Railway deployments",
+            "volume_mount": "/app/data" if is_railway_environment() else "N/A",
+            "database_path": get_database_path()
+        },
         "status": "ready"
     }
 

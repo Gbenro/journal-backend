@@ -1,6 +1,6 @@
-# Journal Backend Service
+# Mirror Scribe Backend with Persistent Storage
 
-FastAPI backend service for the GPT Agent Journaling System. This service provides the database layer and core CRUD operations for journal entries using SQLite for maximum reliability.
+FastAPI backend service for the GPT Agent Journaling System with intelligent tagging and persistent storage. This service provides the database layer and core CRUD operations using SQLite with Railway persistent volumes for maximum reliability and data persistence.
 
 ## 🚀 Railway Deployment
 
@@ -17,10 +17,11 @@ FastAPI backend service for the GPT Agent Journaling System. This service provid
 ## 🏗️ Architecture
 
 This backend service:
-- Uses SQLite database for zero-config reliability
-- Handles database operations for journal entries
-- Provides RESTful API endpoints
-- Includes health monitoring and statistics
+- Uses SQLite database with persistent volume storage
+- Handles database operations for journal entries with intelligent tagging
+- Provides RESTful API endpoints with auto-tagging capabilities
+- Includes comprehensive health monitoring and storage statistics
+- Data persists across Railway deployments and container restarts
 - No external database dependencies
 
 ## 📚 API Endpoints
@@ -61,20 +62,40 @@ uvicorn main:app --reload --port 8000
 ## 🧪 Testing Endpoints
 
 ```bash
-# Health check
+# Health check with storage info
 curl https://your-backend.railway.app/health
 
-# Save a message
+# Storage configuration details
+curl https://your-backend.railway.app/storage-info
+
+# Save a message with tags
 curl -X POST https://your-backend.railway.app/api/save \
   -H "Content-Type: application/json" \
-  -d '{"content": "My first journal entry", "user_id": "user123"}'
+  -d '{"content": "Fixed deployment bug today!", "user_id": "user123", "manual_tags": ["work"], "auto_tag": true}'
 
-# Get messages
-curl https://your-backend.railway.app/api/messages/user123
+# Get messages with tag filtering
+curl https://your-backend.railway.app/api/messages/user123?tags=work,coding
 
-# Get statistics
+# Get all available tags
+curl https://your-backend.railway.app/api/tags
+
+# Get tag suggestions
+curl -X POST https://your-backend.railway.app/api/tags/suggestions \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Had dinner with family", "limit": 5}'
+
+# Get comprehensive statistics
 curl https://your-backend.railway.app/stats
 ```
+
+## 💾 Persistent Storage
+
+The backend uses Railway's persistent volumes to ensure data survives across deployments:
+
+- **Local Development**: Database stored as `journal.db` in current directory
+- **Railway Production**: Database stored at `/app/data/journal.db` on persistent volume
+- **Automatic Detection**: Environment-aware path configuration
+- **Zero Data Loss**: All journal entries and tags persist through redeploys
 
 ## 🔗 Related Services
 
