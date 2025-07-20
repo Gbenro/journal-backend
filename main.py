@@ -28,11 +28,15 @@ app.add_middleware(
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/journal")
-# Clean up DATABASE_URL by removing whitespace/newlines
-DATABASE_URL = DATABASE_URL.strip()
+# Clean up DATABASE_URL by removing ALL whitespace characters
+import re
+DATABASE_URL = re.sub(r'\s+', '', DATABASE_URL)
 # Handle Railway's postgres:// URL format
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Log the cleaned URL for debugging (without password)
+logger.info(f"Database URL (cleaned): {DATABASE_URL.split('@')[0] + '@[REDACTED]'}")
 
 # Create engine with connection pooling disabled for Railway
 engine = create_engine(DATABASE_URL, poolclass=NullPool)
