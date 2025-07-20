@@ -1,6 +1,6 @@
 # Journal Backend Service
 
-FastAPI backend service for the GPT Agent Journaling System. This service provides the database layer and core CRUD operations for journal entries.
+FastAPI backend service for the GPT Agent Journaling System. This service provides the database layer and core CRUD operations for journal entries using SQLite for maximum reliability.
 
 ## 🚀 Railway Deployment
 
@@ -9,21 +9,19 @@ FastAPI backend service for the GPT Agent Journaling System. This service provid
 ### Quick Deploy
 1. Click the Railway button above or go to [Railway](https://railway.app)
 2. Connect this GitHub repository
-3. Add a PostgreSQL database to your project
-4. Set the `DATABASE_URL` environment variable (Railway auto-configures this)
-5. Deploy!
+3. Deploy! (No database setup required - uses built-in SQLite)
 
 ### Environment Variables
-- `DATABASE_URL`: PostgreSQL connection string (auto-configured by Railway)
 - `PORT`: Service port (auto-configured by Railway)
 
 ## 🏗️ Architecture
 
 This backend service:
+- Uses SQLite database for zero-config reliability
 - Handles database operations for journal entries
 - Provides RESTful API endpoints
-- Manages PostgreSQL connections with Railway optimization
-- Includes health monitoring
+- Includes health monitoring and statistics
+- No external database dependencies
 
 ## 📚 API Endpoints
 
@@ -56,11 +54,26 @@ Returns paginated journal entries for a user.
 # Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables
-export DATABASE_URL="postgresql://user:password@localhost/journal"
-
-# Run the service
+# Run the service (SQLite database auto-created)
 uvicorn main:app --reload --port 8000
+```
+
+## 🧪 Testing Endpoints
+
+```bash
+# Health check
+curl https://your-backend.railway.app/health
+
+# Save a message
+curl -X POST https://your-backend.railway.app/api/save \
+  -H "Content-Type: application/json" \
+  -d '{"content": "My first journal entry", "user_id": "user123"}'
+
+# Get messages
+curl https://your-backend.railway.app/api/messages/user123
+
+# Get statistics
+curl https://your-backend.railway.app/stats
 ```
 
 ## 🔗 Related Services
@@ -71,8 +84,7 @@ uvicorn main:app --reload --port 8000
 ## 📦 Dependencies
 
 - FastAPI - Web framework
-- SQLAlchemy - ORM and database toolkit
-- PostgreSQL - Database (provided by Railway)
+- SQLite - Built-in database (no setup required)
 - Uvicorn - ASGI server
 
 ## 🏷️ Version

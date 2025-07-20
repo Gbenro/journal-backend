@@ -1,12 +1,11 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 import logging
-import time
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,16 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Get database URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Log the DATABASE_URL (cleaned for security)
-if DATABASE_URL:
-    # Remove password for logging
-    safe_url = DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else DATABASE_URL
-    logger.info(f"🔍 Database host: {safe_url}")
-else:
-    logger.error("❌ No DATABASE_URL found!")
+# SQLite database file
+DATABASE_FILE = "journal.db"
 
 # Pydantic models
 class MessageRequest(BaseModel):
@@ -40,92 +31,80 @@ class MessageRequest(BaseModel):
     user_id: str
 
 def get_db_connection():
-    """Get database connection with error handling"""
-    if not DATABASE_URL:
-        raise Exception("DATABASE_URL not configured")
-    
+    """Get SQLite database connection"""
     try:
-        # Clean the URL and add SSL
-        conn_string = DATABASE_URL.strip()
-        if "sslmode" not in conn_string:
-            conn_string += "?sslmode=require"
-            
-        conn = psycopg2.connect(
-            conn_string,
-            cursor_factory=RealDictCursor,
-            connect_timeout=30
-        )
+        conn = sqlite3.connect(DATABASE_FILE)
+        conn.row_factory = sqlite3.Row  # Enable row access by column name
         return conn
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise
 
 def init_database():
-    """Initialize database tables - with retries"""
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Create table if it doesn't exist
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    user_id VARCHAR(255) NOT NULL,
-                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            
-            # Create indexes
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
-            """)
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
-            logger.info("✅ Database initialized successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Database initialization attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"⏳ Retrying in {2 ** attempt} seconds...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logger.error("❌ All database initialization attempts failed")
-                return False
+    """Initialize SQLite database and tables"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create messages table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create index for better performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_user_id 
+            ON messages(user_id)
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info("✅ SQLite database initialized successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        return False
 
-# Remove the @app.on_event("startup") - don't fail startup on DB issues
 @app.on_event("startup")
 async def startup_event():
-    """Try to initialize database, but don't fail if it doesn't work"""
-    logger.info("🚀 Starting up...")
-    # Don't block startup on database issues
-    # init_database()  # We'll initialize on first request instead
+    """Initialize database on startup"""
+    logger.info("🚀 Starting up with SQLite...")
+    success = init_database()
+    if success:
+        logger.info("✅ Ready to serve requests")
+    else:
+        logger.warning("⚠️ Database initialization failed, but continuing...")
 
 @app.get("/health")
 async def health_check():
-    """Health check with database test"""
+    """Health check with SQLite database test"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
+        result = cursor.fetchone()
         cursor.close()
         conn.close()
         
         return {
             "status": "healthy",
-            "database": "connected",
+            "database": "sqlite_connected",
+            "database_file": DATABASE_FILE,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return {
             "status": "unhealthy",
-            "database": "disconnected",
+            "database": "sqlite_disconnected", 
             "error": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -136,7 +115,7 @@ async def initialize_database():
     try:
         success = init_database()
         if success:
-            return {"status": "success", "message": "Database initialized"}
+            return {"status": "success", "message": "SQLite database initialized"}
         else:
             raise HTTPException(status_code=503, detail="Database initialization failed")
     except Exception as e:
@@ -144,25 +123,28 @@ async def initialize_database():
 
 @app.post("/api/save")
 async def save_message(message: MessageRequest):
-    """Save a journal entry"""
+    """Save a journal entry to SQLite"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Insert message and get the ID
         cursor.execute(
-            "INSERT INTO messages (content, user_id) VALUES (%s, %s) RETURNING id, timestamp",
-            (message.content, message.user_id)
+            "INSERT INTO messages (content, user_id, timestamp) VALUES (?, ?, ?)",
+            (message.content, message.user_id, datetime.utcnow().isoformat())
         )
         
-        result = cursor.fetchone()
+        message_id = cursor.lastrowid
         conn.commit()
         cursor.close()
         conn.close()
         
+        logger.info(f"💾 Saved message {message_id} for user {message.user_id}")
+        
         return {
             "status": "success",
-            "message_id": result["id"],
-            "timestamp": result["timestamp"].isoformat()
+            "message_id": message_id,
+            "timestamp": datetime.utcnow().isoformat()
         }
         
     except Exception as e:
@@ -170,31 +152,95 @@ async def save_message(message: MessageRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save message: {str(e)}")
 
 @app.get("/api/messages/{user_id}")
-async def get_messages(user_id: str):
-    """Get all messages for a user"""
+async def get_messages(user_id: str, limit: int = 100, offset: int = 0):
+    """Get all messages for a user from SQLite"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Get messages for user with pagination
         cursor.execute(
-            "SELECT id, content, user_id, timestamp FROM messages WHERE user_id = %s ORDER BY timestamp DESC",
-            (user_id,)
+            """SELECT id, content, user_id, timestamp 
+               FROM messages 
+               WHERE user_id = ? 
+               ORDER BY timestamp DESC 
+               LIMIT ? OFFSET ?""",
+            (user_id, limit, offset)
         )
         
-        messages = cursor.fetchall()
+        rows = cursor.fetchall()
         cursor.close()
         conn.close()
         
+        # Convert rows to dictionaries
+        messages = []
+        for row in rows:
+            messages.append({
+                "id": row["id"],
+                "content": row["content"],
+                "user_id": row["user_id"],
+                "timestamp": row["timestamp"]
+            })
+        
+        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id}")
+        
         return {
             "status": "success",
-            "messages": [dict(msg) for msg in messages]
+            "messages": messages,
+            "count": len(messages)
         }
         
     except Exception as e:
         logger.error(f"Get messages failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get messages: {str(e)}")
 
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "service": "Journaling Backend (SQLite)",
+        "version": "1.0.0",
+        "database": "SQLite",
+        "endpoints": [
+            "/health",
+            "/init", 
+            "/api/save",
+            "/api/messages/{user_id}"
+        ],
+        "status": "ready"
+    }
+
+@app.get("/stats")
+async def get_stats():
+    """Get database statistics"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get total message count
+        cursor.execute("SELECT COUNT(*) as total FROM messages")
+        total_messages = cursor.fetchone()["total"]
+        
+        # Get unique user count
+        cursor.execute("SELECT COUNT(DISTINCT user_id) as users FROM messages")
+        unique_users = cursor.fetchone()["users"]
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "total_messages": total_messages,
+            "unique_users": unique_users,
+            "database_file": DATABASE_FILE,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Stats failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
+    logger.info(f"🚀 Starting server on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
