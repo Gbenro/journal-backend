@@ -1,23 +1,19 @@
 import os
-from datetime import datetime
-from typing import List, Optional
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import NullPool
+from datetime import datetime
 import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI app
-app = FastAPI(title="Journal Backend API")
+app = FastAPI(title="Journaling Backend")
 
-# CORS configuration
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,73 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database configuration
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/journal")
-
-def create_database_engine():
-    """Create database engine optimized for Railway PostgreSQL"""
-    import re
-    
-    # Clean up DATABASE_URL by removing ALL whitespace characters
-    database_url = re.sub(r'\s+', '', DATABASE_URL)
-    
-    # Handle Railway's postgres:// URL format
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
-    
-    # Railway PostgreSQL requires SSL
-    if "sslmode" not in database_url:
-        database_url = database_url + "?sslmode=require"
-    
-    engine = create_engine(
-        database_url,
-        poolclass=NullPool,  # No connection pooling for Railway
-        connect_args={
-            "connect_timeout": 60,
-            "application_name": "journaling_backend"
-        },
-        echo=False  # Set to True for SQL debugging
-    )
-    
-    return engine
-
-# Test connection immediately
-def test_connection():
-    try:
-        engine = create_database_engine()
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
-            logger.info("✅ Database connection successful")
-            return engine
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        raise
-
-# Create engine
-engine = test_connection()
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# Database Models
-class Message(Base):
-    __tablename__ = "messages"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    content = Column(Text, nullable=False)
-    user_id = Column(String(255), nullable=False, index=True)
-    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow, index=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
-
-# Create tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully")
-except Exception as e:
-    logger.error(f"Error creating database tables: {e}")
+# Get database URL from environment
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Pydantic models
-class MessageCreate(BaseModel):
+class MessageRequest(BaseModel):
     content: str
     user_id: str
 
@@ -101,111 +35,140 @@ class MessageResponse(BaseModel):
     content: str
     user_id: str
     timestamp: datetime
-    created_at: datetime
-    updated_at: datetime
-    
-    class Config:
-        from_attributes = True
 
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    database: str
-    timestamp: datetime
-
-# Dependency to get database session
-def get_db():
-    db = SessionLocal()
+def get_db_connection():
+    """Get database connection with error handling"""
     try:
-        yield db
-    finally:
-        db.close()
+        # Add SSL requirement for Railway
+        if "sslmode" not in DATABASE_URL:
+            conn_string = DATABASE_URL + "?sslmode=require"
+        else:
+            conn_string = DATABASE_URL
+            
+        conn = psycopg2.connect(
+            conn_string,
+            cursor_factory=RealDictCursor,
+            connect_timeout=30
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Database connection failed: {str(e)}")
 
-@app.get("/health", response_model=HealthResponse)
+def init_database():
+    """Initialize database tables"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                user_id VARCHAR(255) NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        # Create indexes
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info("✅ Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        raise
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    init_database()
+
+@app.get("/health")
 async def health_check():
-    """Check system health and database connectivity"""
+    """Simple health check"""
     try:
-        db = SessionLocal()
-        # Test database connection
-        db.execute(text("SELECT 1"))
-        db.close()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        conn.close()
         
         return {
             "status": "healthy",
-            "service": "backend",
             "database": "connected",
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=500, detail={
-            "status": "unhealthy",
-            "service": "backend",
-            "database": "disconnected",
-            "error": str(e)
-        })
-
-@app.post("/api/save", response_model=dict)
-async def save_message(message: MessageCreate):
-    """Save a new message to the database"""
-    db = SessionLocal()
-    try:
-        db_message = Message(
-            content=message.content,
-            user_id=message.user_id
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "database": "disconnected",
+                "error": str(e)
+            }
         )
-        db.add(db_message)
-        db.commit()
-        db.refresh(db_message)
+
+@app.post("/api/save")
+async def save_message(message: MessageRequest):
+    """Save a journal entry"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        logger.info(f"Message saved for user {message.user_id}")
+        cursor.execute(
+            "INSERT INTO messages (content, user_id) VALUES (%s, %s) RETURNING id, timestamp",
+            (message.content, message.user_id)
+        )
+        
+        result = cursor.fetchone()
+        conn.commit()
+        cursor.close()
+        conn.close()
         
         return {
-            "success": True,
-            "message": "Entry saved successfully",
-            "id": db_message.id
+            "status": "success",
+            "message_id": result["id"],
+            "timestamp": result["timestamp"].isoformat()
         }
+        
     except Exception as e:
-        db.rollback()
-        logger.error(f"Error saving message: {e}")
+        logger.error(f"Save message failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save message: {str(e)}")
-    finally:
-        db.close()
 
-@app.get("/api/messages/{user_id}", response_model=List[MessageResponse])
-async def get_user_messages(user_id: str, limit: Optional[int] = 100, offset: Optional[int] = 0):
-    """Retrieve all messages for a specific user"""
-    db = SessionLocal()
+@app.get("/api/messages/{user_id}")
+async def get_messages(user_id: str):
+    """Get all messages for a user"""
     try:
-        messages = db.query(Message).filter(
-            Message.user_id == user_id
-        ).order_by(
-            Message.timestamp.desc()
-        ).limit(limit).offset(offset).all()
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        logger.info(f"Retrieved {len(messages)} messages for user {user_id}")
+        cursor.execute(
+            "SELECT id, content, user_id, timestamp FROM messages WHERE user_id = %s ORDER BY timestamp DESC",
+            (user_id,)
+        )
         
-        return messages
+        messages = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "messages": [dict(msg) for msg in messages]
+        }
+        
     except Exception as e:
-        logger.error(f"Error retrieving messages: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve messages: {str(e)}")
-    finally:
-        db.close()
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "service": "Journal Backend API",
-        "version": "1.0.0",
-        "endpoints": [
-            "/health",
-            "/api/save",
-            "/api/messages/{user_id}"
-        ]
-    }
+        logger.error(f"Get messages failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get messages: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
