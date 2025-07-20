@@ -28,6 +28,8 @@ app.add_middleware(
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/journal")
+# Clean up DATABASE_URL by removing whitespace/newlines
+DATABASE_URL = DATABASE_URL.strip()
 # Handle Railway's postgres:// URL format
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
