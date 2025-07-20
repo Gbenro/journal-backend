@@ -28,18 +28,48 @@ app.add_middleware(
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/journal")
-# Clean up DATABASE_URL by removing ALL whitespace characters
-import re
-DATABASE_URL = re.sub(r'\s+', '', DATABASE_URL)
-# Handle Railway's postgres:// URL format
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Log the cleaned URL for debugging (without password)
-logger.info(f"Database URL (cleaned): {DATABASE_URL.split('@')[0] + '@[REDACTED]'}")
+def create_database_engine():
+    """Create database engine optimized for Railway PostgreSQL"""
+    import re
+    
+    # Clean up DATABASE_URL by removing ALL whitespace characters
+    database_url = re.sub(r'\s+', '', DATABASE_URL)
+    
+    # Handle Railway's postgres:// URL format
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    
+    # Railway PostgreSQL requires SSL
+    if "sslmode" not in database_url:
+        database_url = database_url + "?sslmode=require"
+    
+    engine = create_engine(
+        database_url,
+        poolclass=NullPool,  # No connection pooling for Railway
+        connect_args={
+            "connect_timeout": 60,
+            "application_name": "journaling_backend"
+        },
+        echo=False  # Set to True for SQL debugging
+    )
+    
+    return engine
 
-# Create engine with connection pooling disabled for Railway
-engine = create_engine(DATABASE_URL, poolclass=NullPool)
+# Test connection immediately
+def test_connection():
+    try:
+        engine = create_database_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1"))
+            logger.info("✅ Database connection successful")
+            return engine
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        raise
+
+# Create engine
+engine = test_connection()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
