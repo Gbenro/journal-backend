@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
@@ -91,7 +91,7 @@ async def health_check():
     try:
         db = SessionLocal()
         # Test database connection
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
         
         return {
