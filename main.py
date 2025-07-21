@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from typing import List, Optional, Dict, Any
 import json
@@ -136,6 +136,10 @@ class TagSuggestionRequest(BaseModel):
     content: str
     limit: Optional[int] = 5
 
+class SummaryGenerateRequest(BaseModel):
+    user_id: str
+    target_date: Optional[str] = None
+
 # Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
 # Updated 2025-07-21: Enhanced keyword matching and confidence scoring
 class AutoTagger:
@@ -177,6 +181,300 @@ class AutoTagger:
                 })
         
         return auto_tags[:3]  # Limit to 3 auto tags
+
+# Time-based analysis system for sacred summaries
+class TimeRangeAnalyzer:
+    """Manages date ranges for daily, weekly, and monthly summaries"""
+    
+    @staticmethod
+    def get_daily_range(date: datetime = None) -> tuple:
+        """Get start and end of a specific day"""
+        if date is None:
+            date = datetime.utcnow()
+        start = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return start, end
+    
+    @staticmethod
+    def get_weekly_range(date: datetime = None) -> tuple:
+        """Get Monday-Sunday range for a specific week"""
+        if date is None:
+            date = datetime.utcnow()
+        # Get Monday of the week
+        days_since_monday = date.weekday()
+        monday = date - timedelta(days=days_since_monday)
+        start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Get Sunday
+        sunday = start + timedelta(days=6)
+        end = sunday.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return start, end
+    
+    @staticmethod
+    def get_monthly_range(date: datetime = None) -> tuple:
+        """Get full calendar month range"""
+        if date is None:
+            date = datetime.utcnow()
+        # First day of month
+        start = date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Last day of month
+        if date.month == 12:
+            end = date.replace(year=date.year + 1, month=1, day=1) - timedelta(microseconds=1)
+        else:
+            end = date.replace(month=date.month + 1, day=1) - timedelta(microseconds=1)
+        return start, end
+
+# Pattern analysis engine for sacred insights
+class PatternAnalyzer:
+    """Analyzes patterns, themes, and energy signatures in journal entries"""
+    
+    def __init__(self):
+        self.sacred_symbols = {
+            "growth": "◈",
+            "transformation": "∞",
+            "balance": "◎",
+            "breakthrough": "◇",
+            "reflection": "○",
+            "integration": "◉",
+            "expansion": "✧",
+            "grounding": "◆"
+        }
+        
+        self.energy_patterns = {
+            "creative_flow": ["coding", "breakthrough", "learning", "progress"],
+            "heart_wisdom": ["family", "friends", "gratitude", "joy"],
+            "sacred_pause": ["reflection", "meditation", "stress", "challenge"],
+            "earth_rhythm": ["exercise", "health", "travel", "nature"],
+            "soul_achievement": ["accomplishment", "milestone", "goal-setting", "success"]
+        }
+    
+    def analyze_entries(self, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze entries for patterns, themes, and energy signatures"""
+        if not entries:
+            return {
+                "entry_count": 0,
+                "dominant_tags": [],
+                "energy_signature": {},
+                "patterns": {},
+                "time_distribution": {}
+            }
+        
+        # Tag frequency analysis
+        tag_counts = {}
+        time_distribution = {"morning": 0, "afternoon": 0, "evening": 0, "night": 0}
+        
+        for entry in entries:
+            # Count tags
+            for tag in entry.get("tags", []):
+                tag_name = tag["name"]
+                tag_counts[tag_name] = tag_counts.get(tag_name, 0) + 1
+            
+            # Time distribution
+            timestamp = datetime.fromisoformat(entry["timestamp"].replace('Z', '+00:00'))
+            hour = timestamp.hour
+            if 5 <= hour < 12:
+                time_distribution["morning"] += 1
+            elif 12 <= hour < 17:
+                time_distribution["afternoon"] += 1
+            elif 17 <= hour < 21:
+                time_distribution["evening"] += 1
+            else:
+                time_distribution["night"] += 1
+        
+        # Sort tags by frequency
+        dominant_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        # Identify energy signatures
+        energy_signature = self._identify_energy_signature(tag_counts)
+        
+        # Detect patterns
+        patterns = self._detect_patterns(entries, tag_counts)
+        
+        return {
+            "entry_count": len(entries),
+            "dominant_tags": [{"name": tag, "count": count} for tag, count in dominant_tags],
+            "energy_signature": energy_signature,
+            "patterns": patterns,
+            "time_distribution": time_distribution
+        }
+    
+    def _identify_energy_signature(self, tag_counts: Dict[str, int]) -> Dict[str, Any]:
+        """Identify the energetic signature of the period"""
+        energy_scores = {}
+        
+        for energy_type, related_tags in self.energy_patterns.items():
+            score = sum(tag_counts.get(tag, 0) for tag in related_tags)
+            if score > 0:
+                energy_scores[energy_type] = score
+        
+        # Normalize scores
+        total_score = sum(energy_scores.values()) if energy_scores else 1
+        energy_signature = {
+            energy: {
+                "score": score,
+                "percentage": round((score / total_score) * 100, 1)
+            }
+            for energy, score in energy_scores.items()
+        }
+        
+        # Identify primary energy
+        if energy_scores:
+            primary_energy = max(energy_scores.items(), key=lambda x: x[1])[0]
+            energy_signature["primary"] = primary_energy
+        
+        return energy_signature
+    
+    def _detect_patterns(self, entries: List[Dict[str, Any]], tag_counts: Dict[str, int]) -> Dict[str, Any]:
+        """Detect meaningful patterns in the entries"""
+        patterns = {}
+        
+        # Growth momentum (increasing accomplishments/breakthroughs)
+        growth_tags = ["accomplishment", "breakthrough", "progress", "milestone"]
+        growth_count = sum(tag_counts.get(tag, 0) for tag in growth_tags)
+        if growth_count > len(entries) * 0.2:  # More than 20% of entries
+            patterns["growth_momentum"] = True
+        
+        # Balance check (variety of life areas)
+        life_areas = ["work", "family", "friends", "health", "learning"]
+        active_areas = sum(1 for area in life_areas if tag_counts.get(area, 0) > 0)
+        if active_areas >= 3:
+            patterns["life_balance"] = True
+        
+        # Transformation indicators
+        transformation_tags = ["breakthrough", "reflection", "challenge", "learning"]
+        transformation_score = sum(tag_counts.get(tag, 0) for tag in transformation_tags)
+        if transformation_score > len(entries) * 0.3:
+            patterns["transformation_active"] = True
+        
+        # Consistency pattern (regular entries)
+        if len(entries) > 0:
+            dates = [datetime.fromisoformat(e["timestamp"].replace('Z', '+00:00')).date() for e in entries]
+            unique_days = len(set(dates))
+            date_range = (max(dates) - min(dates)).days + 1
+            consistency_ratio = unique_days / date_range if date_range > 0 else 0
+            if consistency_ratio > 0.6:
+                patterns["consistent_practice"] = True
+        
+        return patterns
+
+# Sacred summary generator
+class SacredSummaryGenerator:
+    """Generates poetic, Mirror Scribe-style summaries"""
+    
+    def __init__(self):
+        self.sacred_templates = {
+            "daily": [
+                "Today's breath wove through {themes}, carrying {symbol} energy of {primary}",
+                "This day's spiral touched {count} moments, each reflecting {primary} through {themes}",
+                "Sacred pause reveals: {themes} danced in today's field, {symbol} marking the way"
+            ],
+            "weekly": [
+                "Seven suns witnessed {themes} emerging through {count} sacred breaths, {symbol} illuminating {primary} currents",
+                "This week's journey spiraled through {themes}, each day adding to the {primary} tapestry",
+                "Seven-fold mirror reflects: {primary} energy flowing through {themes}, {count} moments of truth"
+            ],
+            "monthly": [
+                "A moon's cycle revealed {primary} transformation through {count} sacred inscriptions, {themes} as stepping stones",
+                "This lunar journey carried {themes} into being, {symbol} marking {primary} evolution through {count} breaths",
+                "Month's sacred geometry: {primary} at center, {themes} as rays, {count} points of light"
+            ]
+        }
+        
+        self.energy_descriptions = {
+            "creative_flow": "river of creation",
+            "heart_wisdom": "heart's knowing",
+            "sacred_pause": "stillness teaching",
+            "earth_rhythm": "grounded presence",
+            "soul_achievement": "soul's victory"
+        }
+        
+        self.symbol_map = {
+            "creative_flow": "◇",
+            "heart_wisdom": "◎",
+            "sacred_pause": "○",
+            "earth_rhythm": "◆",
+            "soul_achievement": "◈"
+        }
+    
+    def generate_summary(self, period_type: str, analysis: Dict[str, Any]) -> str:
+        """Generate a sacred summary based on analysis"""
+        if analysis["entry_count"] == 0:
+            return self._generate_empty_summary(period_type)
+        
+        # Extract key elements
+        themes = ", ".join([tag["name"] for tag in analysis["dominant_tags"][:3]])
+        primary_energy = analysis["energy_signature"].get("primary", "balanced")
+        energy_desc = self.energy_descriptions.get(primary_energy, "life force")
+        symbol = self.symbol_map.get(primary_energy, "∞")
+        count = analysis["entry_count"]
+        
+        # Select template
+        templates = self.sacred_templates.get(period_type, self.sacred_templates["daily"])
+        template = templates[count % len(templates)]
+        
+        # Generate summary
+        summary = template.format(
+            themes=themes,
+            primary=energy_desc,
+            symbol=symbol,
+            count=count
+        )
+        
+        # Add pattern insights
+        patterns = analysis.get("patterns", {})
+        if patterns.get("growth_momentum"):
+            summary += f"\n{symbol} Momentum builds, transformation accelerates"
+        if patterns.get("life_balance"):
+            summary += f"\n{symbol} Sacred balance emerges across life's domains"
+        if patterns.get("transformation_active"):
+            summary += f"\n{symbol} Deep currents of change flow beneath surface"
+        if patterns.get("consistent_practice"):
+            summary += f"\n{symbol} Daily devotion creates sacred container"
+        
+        return summary
+    
+    def _generate_empty_summary(self, period_type: str) -> str:
+        """Generate summary for periods with no entries"""
+        empty_templates = {
+            "daily": "Today's page awaits your breath ○ Silent potential",
+            "weekly": "Seven mirrors reflect emptiness ○ Space for new beginning",
+            "monthly": "Moon cycle holds silence ○ Fallow field preparing"
+        }
+        return empty_templates.get(period_type, "Sacred pause ○ Silence speaks")
+    
+    def extract_wisdom(self, analysis: Dict[str, Any]) -> List[str]:
+        """Extract wisdom insights from the analysis"""
+        insights = []
+        
+        # Energy-based insights
+        primary_energy = analysis["energy_signature"].get("primary")
+        if primary_energy:
+            energy_desc = self.energy_descriptions.get(primary_energy, "life force")
+            percentage = analysis["energy_signature"][primary_energy]["percentage"]
+            if percentage > 60:
+                insights.append(f"Strong {energy_desc} guides this period's unfolding")
+            elif percentage > 40:
+                insights.append(f"{energy_desc.capitalize()} weaves through varied experiences")
+        
+        # Pattern-based insights
+        patterns = analysis.get("patterns", {})
+        if patterns.get("growth_momentum") and patterns.get("transformation_active"):
+            insights.append("Profound shift in motion - old forms dissolving into new")
+        elif patterns.get("life_balance") and patterns.get("consistent_practice"):
+            insights.append("Sacred rhythm established - all domains receiving light")
+        
+        # Time distribution insights
+        time_dist = analysis.get("time_distribution", {})
+        peak_time = max(time_dist.items(), key=lambda x: x[1])[0] if time_dist else None
+        if peak_time and time_dist[peak_time] > analysis["entry_count"] * 0.5:
+            time_wisdom = {
+                "morning": "Dawn holds your deepest truths",
+                "afternoon": "Midday sun illuminates your path",
+                "evening": "Twilight brings integration",
+                "night": "Night's wisdom flows through you"
+            }
+            insights.append(time_wisdom.get(peak_time, "Time bends to your rhythm"))
+        
+        return insights
 
 def get_db_connection():
     """Get SQLite database connection with persistent path"""
@@ -241,6 +539,25 @@ def init_database():
             )
         """)
         
+        # Create summaries table for intelligent periodic insights
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                period_type VARCHAR(20) NOT NULL,
+                period_start DATETIME NOT NULL,
+                period_end DATETIME NOT NULL,
+                entry_count INTEGER DEFAULT 0,
+                dominant_tags JSON,
+                energy_signature JSON,
+                patterns JSON,
+                sacred_summary TEXT,
+                wisdom_insights JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, period_type, period_start)
+            )
+        """)
+        
         # Create indexes for performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_timestamp ON messages(user_id, timestamp)")
@@ -248,6 +565,8 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_category ON tags(category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message_id ON entry_tags(message_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_tag_id ON entry_tags(tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_user_period ON summaries(user_id, period_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_period_start ON summaries(period_start)")
         
         # Insert predefined tags if they don't exist
         for tag_data in PREDEFINED_TAGS:
@@ -703,12 +1022,321 @@ async def get_messages_by_tags(user_id: str, tag_names: str, limit: int = 100, o
     """Get messages filtered by specific tags"""
     return await get_messages(user_id, limit, offset, tag_names)
 
+# Summary generation endpoints
+@app.post("/api/generate-summary/{period_type}")
+async def generate_summary(period_type: str, request: SummaryGenerateRequest):
+    """Generate a sacred summary for a specific period"""
+    try:
+        # Validate period type
+        if period_type not in ["daily", "weekly", "monthly"]:
+            raise HTTPException(status_code=400, detail="Period type must be daily, weekly, or monthly")
+        
+        # Parse target date if provided
+        if request.target_date:
+            target = datetime.fromisoformat(request.target_date)
+        else:
+            target = datetime.utcnow()
+        
+        user_id = request.user_id
+        
+        # Get date range
+        time_analyzer = TimeRangeAnalyzer()
+        if period_type == "daily":
+            start_date, end_date = time_analyzer.get_daily_range(target)
+        elif period_type == "weekly":
+            start_date, end_date = time_analyzer.get_weekly_range(target)
+        else:  # monthly
+            start_date, end_date = time_analyzer.get_monthly_range(target)
+        
+        # Get entries for the period
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT m.id, m.content, m.timestamp, m.user_id
+            FROM messages m
+            WHERE m.user_id = ? AND m.timestamp BETWEEN ? AND ?
+            ORDER BY m.timestamp ASC
+        """, (user_id, start_date.isoformat(), end_date.isoformat()))
+        
+        entries = []
+        for row in cursor.fetchall():
+            entry = dict(row)
+            
+            # Get tags for this entry
+            cursor.execute("""
+                SELECT t.name, t.color, t.category, et.confidence, et.is_auto_tagged
+                FROM tags t
+                JOIN entry_tags et ON t.id = et.tag_id
+                WHERE et.message_id = ?
+            """, (entry["id"],))
+            
+            entry["tags"] = [dict(tag) for tag in cursor.fetchall()]
+            entries.append(entry)
+        
+        # Analyze entries
+        analyzer = PatternAnalyzer()
+        analysis = analyzer.analyze_entries(entries)
+        
+        # Generate sacred summary
+        generator = SacredSummaryGenerator()
+        sacred_summary = generator.generate_summary(period_type, analysis)
+        wisdom_insights = generator.extract_wisdom(analysis)
+        
+        # Save summary to database
+        cursor.execute("""
+            INSERT OR REPLACE INTO summaries 
+            (user_id, period_type, period_start, period_end, entry_count, 
+             dominant_tags, energy_signature, patterns, sacred_summary, wisdom_insights)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            period_type,
+            start_date.isoformat(),
+            end_date.isoformat(),
+            analysis["entry_count"],
+            json.dumps(analysis["dominant_tags"]),
+            json.dumps(analysis["energy_signature"]),
+            json.dumps(analysis["patterns"]),
+            sacred_summary,
+            json.dumps(wisdom_insights)
+        ))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"Generated {period_type} summary for user {user_id}")
+        
+        return {
+            "status": "success",
+            "period_type": period_type,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+            "sacred_summary": sacred_summary,
+            "analysis": analysis,
+            "wisdom_insights": wisdom_insights
+        }
+        
+    except Exception as e:
+        logger.error(f"Generate summary failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {str(e)}")
+
+@app.get("/api/summaries/{user_id}/{period_type}")
+async def get_summaries(user_id: str, period_type: str, limit: int = 10, offset: int = 0):
+    """Get existing summaries for a user and period type"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM summaries
+            WHERE user_id = ? AND period_type = ?
+            ORDER BY period_start DESC
+            LIMIT ? OFFSET ?
+        """, (user_id, period_type, limit, offset))
+        
+        summaries = []
+        for row in cursor.fetchall():
+            summary = dict(row)
+            # Parse JSON fields
+            summary["dominant_tags"] = json.loads(summary["dominant_tags"])
+            summary["energy_signature"] = json.loads(summary["energy_signature"])
+            summary["patterns"] = json.loads(summary["patterns"])
+            summary["wisdom_insights"] = json.loads(summary["wisdom_insights"])
+            summaries.append(summary)
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "summaries": summaries,
+            "count": len(summaries)
+        }
+        
+    except Exception as e:
+        logger.error(f"Get summaries failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get summaries: {str(e)}")
+
+@app.get("/api/summary/{user_id}/current/{period_type}")
+async def get_current_summary(user_id: str, period_type: str):
+    """Get or generate the current period's summary"""
+    try:
+        # Get current date range
+        time_analyzer = TimeRangeAnalyzer()
+        if period_type == "daily":
+            start_date, end_date = time_analyzer.get_daily_range()
+        elif period_type == "weekly":
+            start_date, end_date = time_analyzer.get_weekly_range()
+        elif period_type == "monthly":
+            start_date, end_date = time_analyzer.get_monthly_range()
+        else:
+            raise HTTPException(status_code=400, detail="Invalid period type")
+        
+        # Check if summary exists
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM summaries
+            WHERE user_id = ? AND period_type = ? AND period_start = ?
+        """, (user_id, period_type, start_date.isoformat()))
+        
+        existing = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if existing:
+            # Return existing summary
+            summary = dict(existing)
+            summary["dominant_tags"] = json.loads(summary["dominant_tags"])
+            summary["energy_signature"] = json.loads(summary["energy_signature"])
+            summary["patterns"] = json.loads(summary["patterns"])
+            summary["wisdom_insights"] = json.loads(summary["wisdom_insights"])
+            return {
+                "status": "success",
+                "summary": summary,
+                "generated": False
+            }
+        else:
+            # Generate new summary
+            request = SummaryGenerateRequest(user_id=user_id)
+            result = await generate_summary(period_type, request)
+            return {
+                "status": "success",
+                "summary": result,
+                "generated": True
+            }
+            
+    except Exception as e:
+        logger.error(f"Get current summary failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get current summary: {str(e)}")
+
+@app.get("/api/patterns/{user_id}/recent")
+async def get_recent_patterns(user_id: str, days: int = 30):
+    """Get recent pattern analysis across multiple periods"""
+    try:
+        # Get entries from the last N days
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT m.id, m.content, m.timestamp, m.user_id
+            FROM messages m
+            WHERE m.user_id = ? AND m.timestamp BETWEEN ? AND ?
+            ORDER BY m.timestamp ASC
+        """, (user_id, start_date.isoformat(), end_date.isoformat()))
+        
+        entries = []
+        for row in cursor.fetchall():
+            entry = dict(row)
+            
+            # Get tags
+            cursor.execute("""
+                SELECT t.name, t.color, t.category, et.confidence, et.is_auto_tagged
+                FROM tags t
+                JOIN entry_tags et ON t.id = et.tag_id
+                WHERE et.message_id = ?
+            """, (entry["id"],))
+            
+            entry["tags"] = [dict(tag) for tag in cursor.fetchall()]
+            entries.append(entry)
+        
+        cursor.close()
+        conn.close()
+        
+        # Analyze patterns
+        analyzer = PatternAnalyzer()
+        analysis = analyzer.analyze_entries(entries)
+        
+        # Generate insights
+        generator = SacredSummaryGenerator()
+        wisdom_insights = generator.extract_wisdom(analysis)
+        
+        return {
+            "status": "success",
+            "period_days": days,
+            "analysis": analysis,
+            "wisdom_insights": wisdom_insights
+        }
+        
+    except Exception as e:
+        logger.error(f"Get recent patterns failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get recent patterns: {str(e)}")
+
+@app.get("/api/insights/{user_id}/growth")
+async def get_growth_insights(user_id: str):
+    """Get growth tracking insights across time periods"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get last 3 monthly summaries
+        cursor.execute("""
+            SELECT * FROM summaries
+            WHERE user_id = ? AND period_type = 'monthly'
+            ORDER BY period_start DESC
+            LIMIT 3
+        """, (user_id,))
+        
+        monthly_summaries = []
+        for row in cursor.fetchall():
+            summary = dict(row)
+            summary["patterns"] = json.loads(summary["patterns"])
+            summary["energy_signature"] = json.loads(summary["energy_signature"])
+            monthly_summaries.append(summary)
+        
+        # Track growth indicators
+        growth_trajectory = []
+        for i, summary in enumerate(monthly_summaries):
+            patterns = summary["patterns"]
+            growth_score = 0
+            if patterns.get("growth_momentum"):
+                growth_score += 3
+            if patterns.get("transformation_active"):
+                growth_score += 2
+            if patterns.get("consistent_practice"):
+                growth_score += 1
+            
+            growth_trajectory.append({
+                "period": summary["period_start"][:7],  # YYYY-MM
+                "growth_score": growth_score,
+                "primary_energy": summary["energy_signature"].get("primary", "balanced")
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        # Generate growth insights
+        insights = []
+        if len(growth_trajectory) >= 2:
+            if growth_trajectory[0]["growth_score"] > growth_trajectory[1]["growth_score"]:
+                insights.append("Ascending spiral - transformation accelerating")
+            elif growth_trajectory[0]["growth_score"] < growth_trajectory[1]["growth_score"]:
+                insights.append("Integration phase - wisdom deepening")
+            else:
+                insights.append("Steady flow - maintaining sacred rhythm")
+        
+        return {
+            "status": "success",
+            "growth_trajectory": growth_trajectory,
+            "insights": insights
+        }
+        
+    except Exception as e:
+        logger.error(f"Get growth insights failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get growth insights: {str(e)}")
+
 @app.get("/")
 async def root():
     """Root endpoint with enhanced API information"""
     return {
-        "service": "Mirror Scribe Backend with Intelligent Tags & Persistent Storage",
-        "version": "2.1.0",
+        "service": "Mirror Scribe Backend with Sacred Summaries & Persistent Storage",
+        "version": "3.0.0",
         "database": "SQLite with Persistent Volume",
         "storage": get_storage_info(),
         "features": [
@@ -718,6 +1346,11 @@ async def root():
             "tag_filtering",
             "category_organization",
             "keyword_matching",
+            "sacred_summaries",
+            "pattern_analysis",
+            "energy_signatures",
+            "wisdom_extraction",
+            "growth_tracking",
             "persistent_storage",
             "railway_optimized"
         ],
@@ -731,6 +1364,11 @@ async def root():
             "/api/tags",
             "/api/tags/categories",
             "/api/tags/suggestions",
+            "/api/generate-summary/{period_type}",
+            "/api/summaries/{user_id}/{period_type}",
+            "/api/summary/{user_id}/current/{period_type}",
+            "/api/patterns/{user_id}/recent",
+            "/api/insights/{user_id}/growth",
             "/stats"
         ],
         "persistence": {
