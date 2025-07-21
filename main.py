@@ -10,7 +10,8 @@ import logging
 from typing import List, Optional, Dict, Any
 import json
 
-# Configure logging
+# Configure logging - Last updated: 2025-07-21 for Railway deployment
+# This ensures proper logging across development and production environments
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -25,9 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Persistent storage configuration
+# Persistent storage configuration - Critical for Railway deployments
+# This configuration ensures data persists across container restarts
 def is_railway_environment():
-    """Check if running on Railway"""
+    """Check if running on Railway - determines storage strategy"""
     return bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID") or os.getenv("RAILWAY_DEPLOYMENT_ID"))
 
 def ensure_data_directory():
@@ -134,7 +136,8 @@ class TagSuggestionRequest(BaseModel):
     content: str
     limit: Optional[int] = 5
 
-# Auto-tagging engine
+# Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
+# Updated 2025-07-21: Enhanced keyword matching and confidence scoring
 class AutoTagger:
     def __init__(self):
         pass
@@ -298,7 +301,8 @@ def apply_tags_to_entry(conn: sqlite3.Connection, message_id: int, tags_data: Li
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup with comprehensive logging"""
+    """Initialize database on startup with comprehensive logging
+    Railway deployment test - 2025-07-21 - Verifying persistent volume mount"""
     logger.info("🚀 Starting Mirror Scribe Backend with Intelligent Tags...")
     logger.info(f"📁 Environment: {'Railway' if is_railway_environment() else 'Local'}")
     logger.info(f"💾 Database path: {get_database_path()}")
