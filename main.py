@@ -140,6 +140,26 @@ class SummaryGenerateRequest(BaseModel):
     user_id: str
     target_date: Optional[str] = None
 
+# Enhanced fluency models
+class EntryUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    tags: Optional[List[str]] = None
+    energy_signature: Optional[str] = None
+    intention_flag: Optional[bool] = None
+
+class EntryConnectionRequest(BaseModel):
+    from_entry_id: int
+    to_entry_id: int
+    connection_type: str
+    connection_strength: Optional[float] = 1.0
+    description: Optional[str] = None
+    created_by: Optional[str] = "manual"
+
+class TagHierarchyRequest(BaseModel):
+    parent_tag_name: Optional[str] = None
+    child_tag_name: str
+    relationship_type: Optional[str] = "subcategory"
+
 # Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
 # Updated 2025-07-21: Enhanced keyword matching and confidence scoring
 class AutoTagger:
@@ -289,12 +309,28 @@ class PatternAnalyzer:
         # Detect patterns
         patterns = self._detect_patterns(entries, tag_counts)
         
+        # Add relationship insights if we have entries
+        relationship_insights = {}
+        if entries:
+            # Get user_id from first entry (assumes all entries are from same user)
+            user_id = entries[0].get("user_id")
+            if user_id:
+                # Get date range for relationship insights
+                dates = [datetime.fromisoformat(e["timestamp"].replace('Z', '+00:00')) for e in entries]
+                start_date = min(dates).isoformat()
+                end_date = max(dates).isoformat()
+                
+                # Get relationship insights for this period
+                rel_analyzer = RelationshipAnalyzer()
+                relationship_insights = rel_analyzer.get_relationship_insights(user_id, start_date, end_date)
+        
         return {
             "entry_count": len(entries),
             "dominant_tags": [{"name": tag, "count": count} for tag, count in dominant_tags],
             "energy_signature": energy_signature,
             "patterns": patterns,
-            "time_distribution": time_distribution
+            "time_distribution": time_distribution,
+            "relationship_insights": relationship_insights
         }
     
     def _identify_energy_signature(self, tag_counts: Dict[str, int]) -> Dict[str, Any]:
@@ -430,6 +466,14 @@ class SacredSummaryGenerator:
         if patterns.get("consistent_practice"):
             summary += f"\n{symbol} Daily devotion creates sacred container"
         
+        # Add relationship insights
+        relationship_insights = analysis.get("relationship_insights", {})
+        if relationship_insights.get("active_relationships", 0) > 0:
+            most_mentioned = relationship_insights.get("most_mentioned", [])
+            if most_mentioned:
+                primary_person = most_mentioned[0]
+                summary += f"\n{symbol} Sacred connections: {primary_person['name']} carries {primary_person['primary_emotion']} energy"
+        
         return summary
     
     def _generate_empty_summary(self, period_type: str) -> str:
@@ -475,6 +519,659 @@ class SacredSummaryGenerator:
             insights.append(time_wisdom.get(peak_time, "Time bends to your rhythm"))
         
         return insights
+
+# Relationship detection and tracking system for sacred connections
+class RelationshipAnalyzer:
+    """Detects and tracks relationship patterns in journal entries"""
+    
+    def __init__(self):
+        # Common relationship indicators
+        self.relationship_keywords = {
+            "family": ["mom", "dad", "mother", "father", "sister", "brother", "parent", "family", "cousin", "aunt", "uncle", "grandma", "grandpa", "son", "daughter"],
+            "romantic": ["partner", "boyfriend", "girlfriend", "spouse", "husband", "wife", "lover", "relationship", "dating"],
+            "friend": ["friend", "buddy", "pal", "companion", "bestie", "mate"],
+            "colleague": ["colleague", "coworker", "boss", "manager", "team", "work", "office"],
+            "mentor": ["mentor", "teacher", "coach", "advisor", "guide", "leader"]
+        }
+        
+        # Common name patterns (simple heuristics)
+        self.name_patterns = [
+            r'\b[A-Z][a-z]+\b',  # Capitalized words
+            r'\b(?:with|talked to|saw|met|called)\s+([A-Z][a-z]+)',  # Action + name
+            r'\b([A-Z][a-z]+)(?:\s+said|\'s|is|was)',  # Name + action
+        ]
+        
+        # Emotional context indicators
+        self.emotional_indicators = {
+            "positive": ["love", "grateful", "happy", "joy", "thankful", "wonderful", "amazing", "supportive", "kind", "caring"],
+            "challenging": ["difficult", "stressed", "argument", "conflict", "tension", "frustrated", "disappointed", "hurt"],
+            "neutral": ["talked", "met", "saw", "called", "discussed", "shared", "spent time"],
+            "growth": ["learned", "inspired", "motivated", "encouraged", "helped", "supported", "guided"]
+        }
+    
+    def extract_relationships(self, content: str) -> List[Dict[str, Any]]:
+        """Extract relationship mentions from journal content"""
+        import re
+        
+        relationships = []
+        content_lower = content.lower()
+        
+        # Detect relationship types and associated emotions
+        for rel_type, keywords in self.relationship_keywords.items():
+            for keyword in keywords:
+                if keyword in content_lower:
+                    # Extract emotional context
+                    emotions = self._extract_emotions(content_lower)
+                    relationships.append({
+                        "type": rel_type,
+                        "keyword": keyword,
+                        "emotions": emotions,
+                        "context_strength": content_lower.count(keyword)
+                    })
+        
+        # Extract potential names (simplified - real implementation would use NLP)
+        names = self._extract_names(content)
+        for name in names:
+            relationships.append({
+                "type": "person",
+                "name": name,
+                "emotions": self._extract_emotions(content_lower),
+                "context_strength": 1.0
+            })
+        
+        return relationships
+    
+    def _extract_emotions(self, content: str) -> Dict[str, float]:
+        """Extract emotional context from content"""
+        emotions = {"positive": 0, "challenging": 0, "neutral": 0, "growth": 0}
+        
+        for emotion_type, keywords in self.emotional_indicators.items():
+            count = sum(1 for keyword in keywords if keyword in content)
+            if count > 0:
+                emotions[emotion_type] = min(count / 3.0, 1.0)  # Normalize
+        
+        return emotions
+    
+    def _extract_names(self, content: str) -> List[str]:
+        """Extract potential person names from content (simplified)"""
+        import re
+        
+        names = []
+        # Simple pattern for capitalized words that might be names
+        words = content.split()
+        for word in words:
+            # Basic heuristic: capitalized word, not at start of sentence, not common words
+            if (word and word[0].isupper() and len(word) > 2 and 
+                word.lower() not in ["today", "yesterday", "tomorrow", "work", "home", "morning", "evening"]):
+                names.append(word.strip(".,!?"))
+        
+        return list(set(names))  # Remove duplicates
+    
+    def update_relationship_tracking(self, user_id: str, entry_id: int, relationships: List[Dict[str, Any]], entry_date: str):
+        """Update relationship tracking with new mentions and emotional context"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            current_date = datetime.fromisoformat(entry_date.replace('Z', '+00:00')).date()
+            
+            for rel in relationships:
+                if rel["type"] == "person" and "name" in rel:
+                    person_name = rel["name"]
+                    emotions = rel["emotions"]
+                    
+                    # Check if relationship exists
+                    cursor.execute("""
+                        SELECT id, mention_count, dominant_emotions, energy_patterns 
+                        FROM relationships 
+                        WHERE user_id = ? AND person_name = ?
+                    """, (user_id, person_name))
+                    
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # Update existing relationship
+                        current_emotions = json.loads(existing["dominant_emotions"] or "{}")
+                        current_energy = json.loads(existing["energy_patterns"] or "[]")
+                        
+                        # Merge emotions (weighted average)
+                        for emotion, score in emotions.items():
+                            if emotion in current_emotions:
+                                current_emotions[emotion] = (current_emotions[emotion] + score) / 2
+                            else:
+                                current_emotions[emotion] = score
+                        
+                        # Add current energy pattern
+                        current_energy.append({
+                            "date": current_date.isoformat(),
+                            "emotions": emotions,
+                            "entry_id": entry_id
+                        })
+                        
+                        cursor.execute("""
+                            UPDATE relationships 
+                            SET mention_count = mention_count + 1,
+                                last_mentioned_date = ?,
+                                dominant_emotions = ?,
+                                energy_patterns = ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (current_date, json.dumps(current_emotions), 
+                             json.dumps(current_energy[-10:]), existing["id"]))  # Keep last 10 energy patterns
+                    else:
+                        # Create new relationship
+                        # Try to infer relationship type from context
+                        inferred_type = self._infer_relationship_type(rel)
+                        
+                        cursor.execute("""
+                            INSERT INTO relationships 
+                            (user_id, person_name, relationship_type, first_mentioned_date, 
+                             last_mentioned_date, mention_count, dominant_emotions, energy_patterns)
+                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                        """, (user_id, person_name, inferred_type, current_date, current_date,
+                             json.dumps(emotions), json.dumps([{
+                                 "date": current_date.isoformat(),
+                                 "emotions": emotions,
+                                 "entry_id": entry_id
+                             }])))
+            
+            conn.commit()
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error updating relationship tracking: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def _infer_relationship_type(self, relationship: Dict[str, Any]) -> str:
+        """Infer relationship type from context"""
+        # This is a simplified version - could be enhanced with ML
+        context_keywords = relationship.get("keyword", "").lower()
+        
+        for rel_type, keywords in self.relationship_keywords.items():
+            if any(keyword in context_keywords for keyword in keywords):
+                return rel_type
+        
+        return "unknown"
+    
+    def get_relationship_insights(self, user_id: str, period_start: str, period_end: str) -> Dict[str, Any]:
+        """Generate relationship insights for time period"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get relationships mentioned in period
+            cursor.execute("""
+                SELECT r.*, COUNT(m.id) as period_mentions
+                FROM relationships r
+                LEFT JOIN messages m ON (
+                    m.user_id = r.user_id AND 
+                    m.relationship_mentions LIKE '%' || r.person_name || '%' AND
+                    m.timestamp BETWEEN ? AND ?
+                )
+                WHERE r.user_id = ?
+                GROUP BY r.id
+                HAVING period_mentions > 0 OR r.last_mentioned_date BETWEEN ? AND ?
+                ORDER BY period_mentions DESC, r.mention_count DESC
+            """, (period_start, period_end, user_id, period_start, period_end))
+            
+            relationships = cursor.fetchall()
+            
+            # Analyze relationship patterns
+            insights = {
+                "active_relationships": len(relationships),
+                "most_mentioned": [],
+                "emotional_patterns": {"positive": 0, "challenging": 0, "growth": 0},
+                "relationship_types": {},
+                "energy_shifts": []
+            }
+            
+            for rel in relationships:
+                rel_data = dict(rel)
+                emotions = json.loads(rel_data["dominant_emotions"] or "{}")
+                energy_patterns = json.loads(rel_data["energy_patterns"] or "[]")
+                
+                # Track most mentioned
+                if rel_data["period_mentions"] > 0:
+                    insights["most_mentioned"].append({
+                        "name": rel_data["person_name"],
+                        "type": rel_data["relationship_type"],
+                        "mentions": rel_data["period_mentions"],
+                        "primary_emotion": max(emotions.items(), key=lambda x: x[1])[0] if emotions else "neutral"
+                    })
+                
+                # Aggregate emotional patterns
+                for emotion, score in emotions.items():
+                    if emotion in insights["emotional_patterns"]:
+                        insights["emotional_patterns"][emotion] += score
+                
+                # Count relationship types
+                rel_type = rel_data["relationship_type"]
+                insights["relationship_types"][rel_type] = insights["relationship_types"].get(rel_type, 0) + 1
+            
+            # Normalize emotional patterns
+            total_emotions = sum(insights["emotional_patterns"].values())
+            if total_emotions > 0:
+                for emotion in insights["emotional_patterns"]:
+                    insights["emotional_patterns"][emotion] /= total_emotions
+            
+            return insights
+            
+        except Exception as e:
+            logger.error(f"Error getting relationship insights: {e}")
+            return {"active_relationships": 0, "most_mentioned": [], "emotional_patterns": {}, "relationship_types": {}}
+        finally:
+            cursor.close()
+            conn.close()
+
+# Entry management system for Mirror Scribe fluency
+class EntryManager:
+    """Provides full CRUD operations for journal entries"""
+    
+    def update_entry(self, entry_id: int, user_id: str, new_content: str = None, 
+                    new_tags: List[str] = None, new_energy_signature: str = None,
+                    intention_flag: bool = None) -> bool:
+        """Update existing journal entry with versioning"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Verify entry belongs to user
+            cursor.execute("SELECT * FROM messages WHERE id = ? AND user_id = ?", (entry_id, user_id))
+            current_entry = cursor.fetchone()
+            
+            if not current_entry:
+                return False
+            
+            updates = []
+            params = []
+            
+            # Update content if provided
+            if new_content is not None:
+                updates.append("content = ?")
+                params.append(new_content)
+            
+            # Update manual energy signature
+            if new_energy_signature is not None:
+                updates.append("manual_energy_signature = ?")
+                params.append(new_energy_signature)
+            
+            # Update intention flag
+            if intention_flag is not None:
+                updates.append("intention_flag = ?")
+                params.append(intention_flag)
+            
+            # Always update revision count and timestamp
+            updates.extend(["revision_count = revision_count + 1", "updated_at = CURRENT_TIMESTAMP"])
+            
+            if updates:
+                params.extend([entry_id, user_id])
+                cursor.execute(f"""
+                    UPDATE messages SET {', '.join(updates)}
+                    WHERE id = ? AND user_id = ?
+                """, params)
+            
+            # Update tags if provided
+            if new_tags is not None:
+                # Remove existing tags
+                cursor.execute("DELETE FROM entry_tags WHERE message_id = ?", (entry_id,))
+                
+                # Add new tags
+                for tag_name in new_tags:
+                    tag_id = get_or_create_tag(conn, tag_name)
+                    cursor.execute("""
+                        INSERT INTO entry_tags (message_id, tag_id, is_auto_tagged) 
+                        VALUES (?, ?, FALSE)
+                    """, (entry_id, tag_id))
+            
+            # Update relationship mentions if content changed
+            if new_content is not None:
+                analyzer = RelationshipAnalyzer()
+                relationships = analyzer.extract_relationships(new_content)
+                relationship_names = [rel.get("name") for rel in relationships if rel.get("name")]
+                
+                cursor.execute("UPDATE messages SET relationship_mentions = ? WHERE id = ?", 
+                             (json.dumps(relationship_names), entry_id))
+                
+                # Update relationship tracking
+                entry_timestamp = current_entry["timestamp"]
+                analyzer.update_relationship_tracking(user_id, entry_id, relationships, entry_timestamp)
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error updating entry: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def delete_entry(self, entry_id: int, user_id: str, soft_delete: bool = True) -> bool:
+        """Delete journal entry (soft or hard delete)"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if soft_delete:
+                # Soft delete - mark as deleted but keep data
+                cursor.execute("""
+                    UPDATE messages 
+                    SET content = '[DELETED]', updated_at = CURRENT_TIMESTAMP, revision_count = revision_count + 1
+                    WHERE id = ? AND user_id = ?
+                """, (entry_id, user_id))
+            else:
+                # Hard delete - remove completely (cascades to related tables)
+                cursor.execute("DELETE FROM messages WHERE id = ? AND user_id = ?", (entry_id, user_id))
+            
+            affected_rows = cursor.rowcount
+            conn.commit()
+            return affected_rows > 0
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error deleting entry: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def link_entries(self, from_entry_id: int, to_entry_id: int, connection_type: str, 
+                    user_id: str, connection_strength: float = 1.0, description: str = None,
+                    created_by: str = "manual") -> bool:
+        """Create semantic links between entries"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Verify both entries belong to user
+            cursor.execute("""
+                SELECT COUNT(*) FROM messages 
+                WHERE id IN (?, ?) AND user_id = ?
+            """, (from_entry_id, to_entry_id, user_id))
+            
+            if cursor.fetchone()[0] != 2:
+                return False
+            
+            # Create connection
+            cursor.execute("""
+                INSERT OR REPLACE INTO entry_connections 
+                (from_entry_id, to_entry_id, connection_type, connection_strength, 
+                 connection_description, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (from_entry_id, to_entry_id, connection_type, connection_strength, 
+                 description, created_by))
+            
+            # Create reverse connection for certain types
+            if connection_type in ["relates_to", "continues", "reflects"]:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO entry_connections 
+                    (from_entry_id, to_entry_id, connection_type, connection_strength, 
+                     connection_description, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (to_entry_id, from_entry_id, f"reverse_{connection_type}", 
+                     connection_strength, description, created_by))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error linking entries: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_connected_entries(self, entry_id: int, user_id: str, 
+                            connection_types: List[str] = None) -> List[Dict[str, Any]]:
+        """Get entries connected to this one"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Build query with optional connection type filter
+            where_clause = "WHERE (ec.from_entry_id = ? OR ec.to_entry_id = ?) AND m.user_id = ?"
+            params = [entry_id, entry_id, user_id]
+            
+            if connection_types:
+                placeholders = ",".join("?" * len(connection_types))
+                where_clause += f" AND ec.connection_type IN ({placeholders})"
+                params.extend(connection_types)
+            
+            cursor.execute(f"""
+                SELECT DISTINCT m.*, ec.connection_type, ec.connection_strength, 
+                       ec.connection_description, ec.created_by,
+                       CASE 
+                           WHEN ec.from_entry_id = ? THEN 'outgoing'
+                           ELSE 'incoming'
+                       END as connection_direction
+                FROM entry_connections ec
+                JOIN messages m ON (
+                    (ec.from_entry_id = m.id AND ec.to_entry_id = ?) OR
+                    (ec.to_entry_id = m.id AND ec.from_entry_id = ?)
+                )
+                {where_clause}
+                AND m.id != ?
+                ORDER BY ec.connection_strength DESC, m.timestamp DESC
+            """, [entry_id, entry_id, entry_id] + params + [entry_id])
+            
+            connections = []
+            for row in cursor.fetchall():
+                connection = dict(row)
+                connections.append(connection)
+            
+            return connections
+            
+        except Exception as e:
+            logger.error(f"Error getting connected entries: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+
+# Tag hierarchy system for structured organization
+class TagHierarchyManager:
+    """Manages hierarchical tag relationships and structured organization"""
+    
+    def create_tag_relationship(self, parent_tag_name: str, child_tag_name: str, 
+                              relationship_type: str = "subcategory") -> bool:
+        """Create a parent-child tag relationship"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get or create both tags
+            parent_tag_id = get_or_create_tag(conn, parent_tag_name)
+            child_tag_id = get_or_create_tag(conn, child_tag_name)
+            
+            if parent_tag_id == child_tag_id:
+                return False  # Can't be parent of itself
+            
+            # Check for circular dependencies (simplified check)
+            cursor.execute("""
+                SELECT COUNT(*) FROM tag_hierarchy 
+                WHERE parent_tag_id = ? AND child_tag_id = ?
+            """, (child_tag_id, parent_tag_id))
+            
+            if cursor.fetchone()[0] > 0:
+                return False  # Would create circular dependency
+            
+            # Calculate hierarchy level
+            cursor.execute("""
+                SELECT COALESCE(MAX(hierarchy_level), -1) + 1
+                FROM tag_hierarchy 
+                WHERE child_tag_id = ?
+            """, (parent_tag_id,))
+            
+            hierarchy_level = cursor.fetchone()[0]
+            
+            # Insert relationship
+            cursor.execute("""
+                INSERT OR REPLACE INTO tag_hierarchy 
+                (parent_tag_id, child_tag_id, hierarchy_level, relationship_type)
+                VALUES (?, ?, ?, ?)
+            """, (parent_tag_id, child_tag_id, hierarchy_level, relationship_type))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error creating tag relationship: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_tag_hierarchy(self) -> Dict[str, Any]:
+        """Get complete tag hierarchy structure"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get all hierarchy relationships with tag names
+            cursor.execute("""
+                SELECT 
+                    pt.name as parent_name, pt.category as parent_category, pt.color as parent_color,
+                    ct.name as child_name, ct.category as child_category, ct.color as child_color,
+                    th.hierarchy_level, th.relationship_type
+                FROM tag_hierarchy th
+                LEFT JOIN tags pt ON th.parent_tag_id = pt.id
+                JOIN tags ct ON th.child_tag_id = ct.id
+                ORDER BY th.hierarchy_level, pt.name, ct.name
+            """)
+            
+            relationships = cursor.fetchall()
+            
+            # Also get root tags (tags without parents)
+            cursor.execute("""
+                SELECT t.name, t.category, t.color, t.description
+                FROM tags t
+                WHERE t.id NOT IN (
+                    SELECT child_tag_id FROM tag_hierarchy WHERE parent_tag_id IS NOT NULL
+                )
+                ORDER BY t.category, t.name
+            """)
+            
+            root_tags = cursor.fetchall()
+            
+            # Build hierarchy structure
+            hierarchy = {
+                "root_tags": [dict(tag) for tag in root_tags],
+                "relationships": [],
+                "tag_tree": {}
+            }
+            
+            # Process relationships
+            for rel in relationships:
+                rel_data = dict(rel)
+                hierarchy["relationships"].append(rel_data)
+                
+                # Build tree structure
+                parent_name = rel_data["parent_name"] or "ROOT"
+                if parent_name not in hierarchy["tag_tree"]:
+                    hierarchy["tag_tree"][parent_name] = {"children": [], "info": {}}
+                
+                if rel_data["parent_name"]:
+                    hierarchy["tag_tree"][parent_name]["info"] = {
+                        "category": rel_data["parent_category"],
+                        "color": rel_data["parent_color"]
+                    }
+                
+                hierarchy["tag_tree"][parent_name]["children"].append({
+                    "name": rel_data["child_name"],
+                    "category": rel_data["child_category"],
+                    "color": rel_data["child_color"],
+                    "relationship_type": rel_data["relationship_type"],
+                    "level": rel_data["hierarchy_level"]
+                })
+            
+            return hierarchy
+            
+        except Exception as e:
+            logger.error(f"Error getting tag hierarchy: {e}")
+            return {"root_tags": [], "relationships": [], "tag_tree": {}}
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_tag_ancestors(self, tag_name: str) -> List[str]:
+        """Get all ancestor tags for a given tag"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            ancestors = []
+            current_tag = tag_name
+            
+            # Walk up the hierarchy
+            for _ in range(10):  # Prevent infinite loops
+                cursor.execute("""
+                    SELECT pt.name
+                    FROM tag_hierarchy th
+                    JOIN tags ct ON th.child_tag_id = ct.id
+                    JOIN tags pt ON th.parent_tag_id = pt.id
+                    WHERE ct.name = ?
+                """, (current_tag,))
+                
+                parent = cursor.fetchone()
+                if not parent:
+                    break
+                    
+                parent_name = parent["name"]
+                if parent_name in ancestors:
+                    break  # Circular reference detected
+                    
+                ancestors.append(parent_name)
+                current_tag = parent_name
+            
+            return ancestors[::-1]  # Reverse to get root-to-leaf order
+            
+        except Exception as e:
+            logger.error(f"Error getting tag ancestors: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_tag_descendants(self, tag_name: str) -> List[str]:
+        """Get all descendant tags for a given tag"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            descendants = []
+            to_process = [tag_name]
+            
+            while to_process:
+                current_tag = to_process.pop(0)
+                
+                cursor.execute("""
+                    SELECT ct.name
+                    FROM tag_hierarchy th
+                    JOIN tags pt ON th.parent_tag_id = pt.id
+                    JOIN tags ct ON th.child_tag_id = ct.id
+                    WHERE pt.name = ?
+                """, (current_tag,))
+                
+                children = cursor.fetchall()
+                for child in children:
+                    child_name = child["name"]
+                    if child_name not in descendants:
+                        descendants.append(child_name)
+                        to_process.append(child_name)
+            
+            return descendants
+            
+        except Exception as e:
+            logger.error(f"Error getting tag descendants: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
 
 def get_db_connection():
     """Get SQLite database connection with persistent path"""
@@ -553,8 +1250,60 @@ def init_database():
                 patterns JSON,
                 sacred_summary TEXT,
                 wisdom_insights JSON,
+                relationship_insights JSON,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, period_type, period_start)
+            )
+        """)
+        
+        # Create relationships table for tracking people and connections
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                person_name TEXT NOT NULL,
+                relationship_type TEXT DEFAULT 'unknown',
+                first_mentioned_date DATE,
+                last_mentioned_date DATE,
+                mention_count INTEGER DEFAULT 0,
+                dominant_emotions JSON,
+                energy_patterns JSON,
+                interaction_quality_trend JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, person_name)
+            )
+        """)
+        
+        # Create entry connections for semantic linking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS entry_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_entry_id INTEGER NOT NULL,
+                to_entry_id INTEGER NOT NULL,
+                connection_type TEXT NOT NULL,
+                connection_strength FLOAT DEFAULT 1.0,
+                connection_description TEXT,
+                created_by TEXT DEFAULT 'auto',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (from_entry_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (to_entry_id) REFERENCES messages(id) ON DELETE CASCADE,
+                UNIQUE(from_entry_id, to_entry_id, connection_type)
+            )
+        """)
+        
+        # Create tag hierarchy for structured organization
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tag_hierarchy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_tag_id INTEGER,
+                child_tag_id INTEGER NOT NULL,
+                hierarchy_level INTEGER DEFAULT 0,
+                relationship_type TEXT DEFAULT 'subcategory',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_tag_id) REFERENCES tags(id) ON DELETE CASCADE,
+                FOREIGN KEY (child_tag_id) REFERENCES tags(id) ON DELETE CASCADE,
+                UNIQUE(parent_tag_id, child_tag_id)
             )
         """)
         
@@ -567,6 +1316,34 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_tag_id ON entry_tags(tag_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_user_period ON summaries(user_id, period_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_period_start ON summaries(period_start)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user_id ON relationships(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user_person ON relationships(user_id, person_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_from ON entry_connections(from_entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_to ON entry_connections(to_entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_hierarchy_parent ON tag_hierarchy(parent_tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_hierarchy_child ON tag_hierarchy(child_tag_id)")
+        
+        # Add enhanced columns to messages table if they don't exist
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN intention_flag BOOLEAN DEFAULT FALSE")
+        except:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN manual_energy_signature TEXT")
+        except:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN relationship_mentions JSON")
+        except:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN revision_count INTEGER DEFAULT 0")
+        except:
+            pass  # Column already exists
         
         # Insert predefined tags if they don't exist
         for tag_data in PREDEFINED_TAGS:
@@ -932,9 +1709,24 @@ async def save_message(message: MessageRequest):
         # Apply all tags to the entry
         apply_tags_to_entry(conn, message_id, applied_tags)
         
+        # Extract and track relationships
+        relationship_analyzer = RelationshipAnalyzer()
+        relationships = relationship_analyzer.extract_relationships(message.content)
+        relationship_names = [rel.get("name") for rel in relationships if rel.get("name")]
+        
+        # Update relationship mentions in message
+        cursor.execute("""
+            UPDATE messages SET relationship_mentions = ? WHERE id = ?
+        """, (json.dumps(relationship_names), message_id))
+        
         conn.commit()
         cursor.close()
         conn.close()
+        
+        # Update relationship tracking (done after commit to avoid long transactions)
+        if relationships:
+            entry_timestamp = datetime.utcnow().isoformat()
+            relationship_analyzer.update_relationship_tracking(message.user_id, message_id, relationships, entry_timestamp)
         
         logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags for user {message.user_id}")
         
@@ -1331,12 +2123,262 @@ async def get_growth_insights(user_id: str):
         logger.error(f"Get growth insights failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get growth insights: {str(e)}")
 
+# Enhanced fluency endpoints for Mirror Scribe editorial capabilities
+@app.put("/api/entries/{entry_id}")
+async def update_entry(entry_id: int, request: EntryUpdateRequest, user_id: str = "user123"):
+    """Update existing journal entry with full editorial control"""
+    try:
+        entry_manager = EntryManager()
+        success = entry_manager.update_entry(
+            entry_id=entry_id,
+            user_id=user_id,
+            new_content=request.content,
+            new_tags=request.tags,
+            new_energy_signature=request.energy_signature,
+            intention_flag=request.intention_flag
+        )
+        
+        if success:
+            logger.info(f"✏️ Updated entry {entry_id} for user {user_id}")
+            return {
+                "status": "success",
+                "message": "Entry updated successfully",
+                "entry_id": entry_id,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Entry not found or permission denied")
+            
+    except Exception as e:
+        logger.error(f"Update entry failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update entry: {str(e)}")
+
+@app.delete("/api/entries/{entry_id}")
+async def delete_entry(entry_id: int, user_id: str = "user123", hard_delete: bool = False):
+    """Delete journal entry (soft or hard delete)"""
+    try:
+        entry_manager = EntryManager()
+        success = entry_manager.delete_entry(entry_id, user_id, soft_delete=not hard_delete)
+        
+        if success:
+            delete_type = "hard" if hard_delete else "soft"
+            logger.info(f"🗑️ {delete_type} deleted entry {entry_id} for user {user_id}")
+            return {
+                "status": "success",
+                "message": f"Entry {'permanently deleted' if hard_delete else 'marked as deleted'}",
+                "entry_id": entry_id,
+                "deleted_at": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Entry not found or permission denied")
+            
+    except Exception as e:
+        logger.error(f"Delete entry failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete entry: {str(e)}")
+
+@app.post("/api/entries/connect")
+async def connect_entries(request: EntryConnectionRequest, user_id: str = "user123"):
+    """Create semantic connections between journal entries"""
+    try:
+        entry_manager = EntryManager()
+        success = entry_manager.link_entries(
+            from_entry_id=request.from_entry_id,
+            to_entry_id=request.to_entry_id,
+            connection_type=request.connection_type,
+            user_id=user_id,
+            connection_strength=request.connection_strength,
+            description=request.description,
+            created_by=request.created_by
+        )
+        
+        if success:
+            logger.info(f"🔗 Connected entries {request.from_entry_id} -> {request.to_entry_id} ({request.connection_type})")
+            return {
+                "status": "success",
+                "message": "Entries connected successfully",
+                "connection": {
+                    "from_entry_id": request.from_entry_id,
+                    "to_entry_id": request.to_entry_id,
+                    "connection_type": request.connection_type,
+                    "strength": request.connection_strength
+                },
+                "created_at": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Failed to create connection - entries may not exist")
+            
+    except Exception as e:
+        logger.error(f"Connect entries failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to connect entries: {str(e)}")
+
+@app.get("/api/entries/{entry_id}/connected")
+async def get_connected_entries(entry_id: int, user_id: str = "user123", 
+                              connection_types: Optional[str] = None):
+    """Get entries connected to this one"""
+    try:
+        types_filter = connection_types.split(",") if connection_types else None
+        
+        entry_manager = EntryManager()
+        connections = entry_manager.get_connected_entries(entry_id, user_id, types_filter)
+        
+        logger.info(f"🔍 Found {len(connections)} connected entries for entry {entry_id}")
+        
+        return {
+            "status": "success",
+            "entry_id": entry_id,
+            "connected_entries": connections,
+            "count": len(connections),
+            "filtered_by": types_filter
+        }
+        
+    except Exception as e:
+        logger.error(f"Get connected entries failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get connected entries: {str(e)}")
+
+@app.put("/api/entries/{entry_id}/intention")
+async def set_intention_flag(entry_id: int, intention: bool, user_id: str = "user123"):
+    """Mark entry as intention or remove intention flag"""
+    try:
+        entry_manager = EntryManager()
+        success = entry_manager.update_entry(
+            entry_id=entry_id,
+            user_id=user_id,
+            intention_flag=intention
+        )
+        
+        if success:
+            action = "set" if intention else "removed"
+            logger.info(f"🎯 Intention flag {action} for entry {entry_id}")
+            return {
+                "status": "success",
+                "message": f"Intention flag {'set' if intention else 'removed'}",
+                "entry_id": entry_id,
+                "intention_flag": intention,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Entry not found or permission denied")
+            
+    except Exception as e:
+        logger.error(f"Set intention flag failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to set intention flag: {str(e)}")
+
+# Relationship insights endpoints
+@app.get("/api/relationships/{user_id}")
+async def get_relationships(user_id: str, period_days: int = 30):
+    """Get relationship insights and connections for user"""
+    try:
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=period_days)
+        
+        analyzer = RelationshipAnalyzer()
+        insights = analyzer.get_relationship_insights(
+            user_id=user_id,
+            period_start=start_date.isoformat(),
+            period_end=end_date.isoformat()
+        )
+        
+        logger.info(f"👥 Retrieved relationship insights for user {user_id} ({period_days} days)")
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "period_days": period_days,
+            "insights": insights
+        }
+        
+    except Exception as e:
+        logger.error(f"Get relationships failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get relationships: {str(e)}")
+
+# Tag hierarchy endpoints
+@app.get("/api/tags/hierarchy")
+async def get_tag_hierarchy():
+    """Get hierarchical tag structure"""
+    try:
+        hierarchy_manager = TagHierarchyManager()
+        hierarchy = hierarchy_manager.get_tag_hierarchy()
+        
+        logger.info("📊 Retrieved tag hierarchy structure")
+        
+        return {
+            "status": "success",
+            "hierarchy": hierarchy
+        }
+        
+    except Exception as e:
+        logger.error(f"Get tag hierarchy failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get tag hierarchy: {str(e)}")
+
+@app.post("/api/tags/hierarchy")
+async def create_tag_relationship(request: TagHierarchyRequest):
+    """Create parent-child tag relationships"""
+    try:
+        hierarchy_manager = TagHierarchyManager()
+        success = hierarchy_manager.create_tag_relationship(
+            parent_tag_name=request.parent_tag_name,
+            child_tag_name=request.child_tag_name,
+            relationship_type=request.relationship_type
+        )
+        
+        if success:
+            logger.info(f"🏷️ Created tag relationship: {request.parent_tag_name} -> {request.child_tag_name}")
+            return {
+                "status": "success",
+                "message": "Tag relationship created successfully",
+                "parent": request.parent_tag_name,
+                "child": request.child_tag_name,
+                "relationship_type": request.relationship_type
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Failed to create tag relationship - may cause circular dependency")
+            
+    except Exception as e:
+        logger.error(f"Create tag relationship failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create tag relationship: {str(e)}")
+
+@app.get("/api/tags/{tag_name}/ancestors")
+async def get_tag_ancestors(tag_name: str):
+    """Get all ancestor tags for a given tag"""
+    try:
+        hierarchy_manager = TagHierarchyManager()
+        ancestors = hierarchy_manager.get_tag_ancestors(tag_name)
+        
+        return {
+            "status": "success",
+            "tag": tag_name,
+            "ancestors": ancestors,
+            "hierarchy_path": " > ".join(ancestors + [tag_name]) if ancestors else tag_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Get tag ancestors failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get tag ancestors: {str(e)}")
+
+@app.get("/api/tags/{tag_name}/descendants")
+async def get_tag_descendants(tag_name: str):
+    """Get all descendant tags for a given tag"""
+    try:
+        hierarchy_manager = TagHierarchyManager()
+        descendants = hierarchy_manager.get_tag_descendants(tag_name)
+        
+        return {
+            "status": "success",
+            "tag": tag_name,
+            "descendants": descendants,
+            "count": len(descendants)
+        }
+        
+    except Exception as e:
+        logger.error(f"Get tag descendants failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get tag descendants: {str(e)}")
+
 @app.get("/")
 async def root():
     """Root endpoint with enhanced API information"""
     return {
-        "service": "Mirror Scribe Backend with Sacred Summaries & Persistent Storage",
-        "version": "3.0.0",
+        "service": "Mirror Scribe Backend with Full Editorial Fluency & Relationship Intelligence",
+        "version": "4.0.0",
         "database": "SQLite with Persistent Volume",
         "storage": get_storage_info(),
         "features": [
@@ -1351,6 +2393,11 @@ async def root():
             "energy_signatures",
             "wisdom_extraction",
             "growth_tracking",
+            "relationship_intelligence",
+            "editorial_fluency",
+            "entry_connections",
+            "tag_hierarchy",
+            "intention_tracking",
             "persistent_storage",
             "railway_optimized"
         ],
@@ -1369,6 +2416,14 @@ async def root():
             "/api/summary/{user_id}/current/{period_type}",
             "/api/patterns/{user_id}/recent",
             "/api/insights/{user_id}/growth",
+            "/api/entries/{entry_id}",
+            "/api/entries/connect",
+            "/api/entries/{entry_id}/connected",
+            "/api/entries/{entry_id}/intention",
+            "/api/relationships/{user_id}",
+            "/api/tags/hierarchy",
+            "/api/tags/{tag_name}/ancestors",
+            "/api/tags/{tag_name}/descendants",
             "/stats"
         ],
         "persistence": {
