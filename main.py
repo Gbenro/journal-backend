@@ -147,6 +147,15 @@ class EntryUpdateRequest(BaseModel):
     energy_signature: Optional[str] = None
     intention_flag: Optional[bool] = None
 
+# GPT-specific models for refined updates
+class GPTEntryUpdateRequest(BaseModel):
+    new_tags: Optional[List[str]] = None
+    updated_content: Optional[str] = None
+    updated_emotions: Optional[str] = None
+
+class GPTTagAddRequest(BaseModel):
+    tags: List[str]
+
 class EntryConnectionRequest(BaseModel):
     from_entry_id: int
     to_entry_id: int
@@ -1352,6 +1361,9 @@ def init_database():
                 VALUES (?, ?, TRUE, ?, ?)
             """, (tag_data["name"], tag_data["category"], tag_data["color"], tag_data["description"]))
         
+        # Create indexes for performance optimization
+        create_indexes(cursor)
+        
         conn.commit()
         cursor.close()
         conn.close()
@@ -1362,6 +1374,50 @@ def init_database():
     except Exception as e:
         logger.error(f"❌ Database initialization failed at {db_path}: {e}")
         return False
+
+def create_indexes(cursor):
+    """Create database indexes for performance optimization"""
+    try:
+        logger.info("🔍 Creating database indexes for tag operations...")
+        
+        # Messages table indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_timestamp ON messages(user_id, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_updated_at ON messages(updated_at)")
+        
+        # Tags table indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_category ON tags(category)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_predefined ON tags(is_predefined)")
+        
+        # Entry_tags relationship indexes (most important for performance)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message_id ON entry_tags(message_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_tag_id ON entry_tags(tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_created_at ON entry_tags(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_auto_tagged ON entry_tags(is_auto_tagged)")
+        
+        # Composite indexes for common query patterns
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message_tag ON entry_tags(message_id, tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_tags_user ON messages(user_id) WHERE user_id IN (SELECT DISTINCT user_id FROM messages)")
+        
+        # Summaries table indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_user_period ON summaries(user_id, period_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_period_range ON summaries(period_start, period_end)")
+        
+        # Relationships table indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_user_id ON relationships(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_relationships_name ON relationships(name)")
+        
+        # Entry connections indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_from ON entry_connections(from_entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_to ON entry_connections(to_entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_type ON entry_connections(connection_type)")
+        
+        logger.info("✅ Database indexes created successfully")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Some indexes may already exist or failed to create: {e}")
 
 def get_or_create_tag(conn: sqlite3.Connection, tag_name: str) -> int:
     """Get existing tag ID or create new tag"""
@@ -2433,6 +2489,483 @@ async def root():
         },
         "status": "ready"
     }
+
+# GPT-specific endpoints for enhanced entry refinement
+@app.put("/api/gpt/update-entry/{entry_id}")
+async def gpt_update_entry(entry_id: int, user_id: str, request: GPTEntryUpdateRequest):
+    """GPT-optimized endpoint for updating entries with better tag merging"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Verify entry belongs to user
+        cursor.execute("SELECT * FROM messages WHERE id = ? AND user_id = ?", (entry_id, user_id))
+        entry = cursor.fetchone()
+        
+        if not entry:
+            raise HTTPException(status_code=404, detail="Entry not found or permission denied")
+        
+        # Update content if provided
+        if request.updated_content:
+            cursor.execute("""
+                UPDATE messages 
+                SET content = ?, updated_at = CURRENT_TIMESTAMP, revision_count = revision_count + 1
+                WHERE id = ? AND user_id = ?
+            """, (request.updated_content, entry_id, user_id))
+        
+        # Update emotions (stored as manual energy signature)
+        if request.updated_emotions:
+            cursor.execute("""
+                UPDATE messages 
+                SET manual_energy_signature = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            """, (request.updated_emotions, entry_id, user_id))
+        
+        # Merge new tags with existing ones
+        if request.new_tags:
+            # Get existing tags
+            cursor.execute("""
+                SELECT t.name FROM tags t
+                JOIN entry_tags et ON t.id = et.tag_id
+                WHERE et.message_id = ?
+            """, (entry_id,))
+            existing_tags = {row["name"] for row in cursor.fetchall()}
+            
+            # Merge with new tags (no duplicates)
+            all_tags = existing_tags.union(set(request.new_tags))
+            
+            # Clear current tags
+            cursor.execute("DELETE FROM entry_tags WHERE message_id = ?", (entry_id,))
+            
+            # Add all tags back
+            for tag_name in all_tags:
+                tag_id = get_or_create_tag(conn, tag_name)
+                cursor.execute("""
+                    INSERT INTO entry_tags (message_id, tag_id, is_auto_tagged) 
+                    VALUES (?, ?, FALSE)
+                """, (entry_id, tag_id))
+        
+        conn.commit()
+        
+        # Get updated entry with tags
+        cursor.execute("""
+            SELECT m.*, GROUP_CONCAT(t.name) as tag_names
+            FROM messages m
+            LEFT JOIN entry_tags et ON m.id = et.message_id
+            LEFT JOIN tags t ON et.tag_id = t.id
+            WHERE m.id = ?
+            GROUP BY m.id
+        """, (entry_id,))
+        updated_entry = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"✨ GPT updated entry {entry_id} for user {user_id}")
+        
+        return {
+            "status": "success",
+            "message": "Entry updated successfully",
+            "entry_id": entry_id,
+            "tags": updated_entry["tag_names"].split(",") if updated_entry["tag_names"] else [],
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GPT update entry failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update entry: {str(e)}")
+
+@app.post("/api/gpt/add-tags-to-entry/{entry_id}")
+async def gpt_add_tags_to_entry(entry_id: int, user_id: str, request: GPTTagAddRequest):
+    """Add tags to existing entry without removing current tags"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Verify entry belongs to user
+        cursor.execute("SELECT id FROM messages WHERE id = ? AND user_id = ?", (entry_id, user_id))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Entry not found or permission denied")
+        
+        # Get existing tags
+        cursor.execute("""
+            SELECT t.name FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            WHERE et.message_id = ?
+        """, (entry_id,))
+        existing_tags = {row["name"] for row in cursor.fetchall()}
+        
+        # Add new tags (skip duplicates)
+        added_tags = []
+        for tag_name in request.tags:
+            if tag_name not in existing_tags:
+                tag_id = get_or_create_tag(conn, tag_name)
+                try:
+                    cursor.execute("""
+                        INSERT INTO entry_tags (message_id, tag_id, is_auto_tagged) 
+                        VALUES (?, ?, FALSE)
+                    """, (entry_id, tag_id))
+                    added_tags.append(tag_name)
+                except sqlite3.IntegrityError:
+                    # Tag already exists for this entry
+                    pass
+        
+        # Update timestamp
+        cursor.execute("""
+            UPDATE messages 
+            SET updated_at = CURRENT_TIMESTAMP, revision_count = revision_count + 1
+            WHERE id = ?
+        """, (entry_id,))
+        
+        conn.commit()
+        
+        # Get all tags for the entry
+        cursor.execute("""
+            SELECT t.name, t.category, t.color FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            WHERE et.message_id = ?
+            ORDER BY t.name
+        """, (entry_id,))
+        all_tags = [{"name": row["name"], "category": row["category"], "color": row["color"]} 
+                   for row in cursor.fetchall()]
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"🏷️ Added {len(added_tags)} tags to entry {entry_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Added {len(added_tags)} new tags",
+            "added_tags": added_tags,
+            "all_tags": all_tags,
+            "total_tags": len(all_tags)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Add tags to entry failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add tags: {str(e)}")
+
+# Tag visibility endpoints for sacred thread tracking
+@app.get("/api/gpt/tags/list/{user_id}")
+async def gpt_get_user_tags(user_id: str):
+    """Get all unique tags for a user with usage statistics"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                t.name as tag,
+                t.category,
+                t.color,
+                COUNT(DISTINCT et.message_id) as count,
+                MIN(m.timestamp) as first_used,
+                MAX(m.timestamp) as last_used
+            FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            JOIN messages m ON et.message_id = m.id
+            WHERE m.user_id = ?
+            GROUP BY t.id, t.name, t.category, t.color
+            ORDER BY count DESC, t.name
+        """, (user_id,))
+        
+        tags = []
+        for row in cursor.fetchall():
+            tags.append({
+                "tag": row["tag"],
+                "category": row["category"],
+                "color": row["color"],
+                "count": row["count"],
+                "first_used": row["first_used"],
+                "last_used": row["last_used"]
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"📋 Retrieved {len(tags)} tags for user {user_id}")
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "total_tags": len(tags),
+            "tags": tags
+        }
+        
+    except Exception as e:
+        logger.error(f"Get user tags failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get tags: {str(e)}")
+
+@app.get("/api/gpt/tags/temporal/{user_id}")
+async def gpt_get_temporal_tags(user_id: str, period: str = "weekly"):
+    """Get tag evolution over time periods"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Determine period grouping
+        if period == "weekly":
+            date_format = '%Y-W%W'
+            days_back = 90  # Last 3 months
+        elif period == "monthly":
+            date_format = '%Y-%m'
+            days_back = 365  # Last year
+        else:
+            date_format = '%Y-%m-%d'
+            days_back = 30  # Last month
+        
+        start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+        
+        # Get tags by period
+        cursor.execute("""
+            SELECT 
+                strftime(?, m.timestamp) as period,
+                t.name as tag,
+                COUNT(*) as usage_count,
+                MIN(m.timestamp) as period_start
+            FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            JOIN messages m ON et.message_id = m.id
+            WHERE m.user_id = ? AND m.timestamp >= ?
+            GROUP BY period, t.name
+            ORDER BY period DESC, usage_count DESC
+        """, (date_format, user_id, start_date))
+        
+        # Organize by period
+        periods = {}
+        all_tags = set()
+        
+        for row in cursor.fetchall():
+            period = row["period"]
+            if period not in periods:
+                periods[period] = {
+                    "period": period,
+                    "tags": {},
+                    "new_tags": [],
+                    "period_start": row["period_start"]
+                }
+            
+            tag_name = row["tag"]
+            periods[period]["tags"][tag_name] = row["usage_count"]
+            
+            if tag_name not in all_tags:
+                periods[period]["new_tags"].append(tag_name)
+                all_tags.add(tag_name)
+        
+        # Convert to list and identify trending tags
+        period_list = []
+        for period_key in sorted(periods.keys(), reverse=True):
+            period_data = periods[period_key]
+            
+            # Find trending tags (most used in this period)
+            trending = sorted(period_data["tags"].items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            period_list.append({
+                "period": period_key,
+                "new_tags": period_data["new_tags"],
+                "trending": [tag[0] for tag in trending],
+                "tag_count": len(period_data["tags"]),
+                "total_uses": sum(period_data["tags"].values())
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"📊 Retrieved temporal tag data for user {user_id}")
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "period_type": period,
+            "periods": period_list
+        }
+        
+    except Exception as e:
+        logger.error(f"Get temporal tags failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get temporal tags: {str(e)}")
+
+@app.get("/api/gpt/tags/preview/{tag_name}")
+async def gpt_preview_tag_entries(tag_name: str, user_id: str, limit: int = 10):
+    """Get preview of entries containing a specific tag"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                m.id,
+                m.timestamp as date,
+                SUBSTR(m.content, 1, 150) as preview,
+                m.manual_energy_signature as emotion,
+                GROUP_CONCAT(t2.name) as all_tags
+            FROM messages m
+            JOIN entry_tags et ON m.id = et.message_id
+            JOIN tags t ON et.tag_id = t.id
+            LEFT JOIN entry_tags et2 ON m.id = et2.message_id
+            LEFT JOIN tags t2 ON et2.tag_id = t2.id
+            WHERE t.name = ? AND m.user_id = ?
+            GROUP BY m.id
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+        """, (tag_name, user_id, limit))
+        
+        entries = []
+        for row in cursor.fetchall():
+            preview_text = row["preview"]
+            if len(preview_text) == 150:
+                preview_text += "..."
+            
+            entries.append({
+                "id": row["id"],
+                "date": row["date"],
+                "preview": preview_text,
+                "emotion": row["emotion"] or "neutral",
+                "tags": row["all_tags"].split(",") if row["all_tags"] else []
+            })
+        
+        # Get tag statistics
+        cursor.execute("""
+            SELECT 
+                COUNT(DISTINCT m.id) as total_entries,
+                MIN(m.timestamp) as first_use,
+                MAX(m.timestamp) as last_use
+            FROM messages m
+            JOIN entry_tags et ON m.id = et.message_id
+            JOIN tags t ON et.tag_id = t.id
+            WHERE t.name = ? AND m.user_id = ?
+        """, (tag_name, user_id))
+        
+        stats = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"👁️ Retrieved preview for tag '{tag_name}'")
+        
+        return {
+            "status": "success",
+            "tag": tag_name,
+            "total_entries": stats["total_entries"],
+            "first_use": stats["first_use"],
+            "last_use": stats["last_use"],
+            "entries": entries
+        }
+        
+    except Exception as e:
+        logger.error(f"Preview tag entries failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to preview tag: {str(e)}")
+
+@app.get("/api/gpt/tags/sacred-threads/{user_id}")
+async def gpt_get_sacred_threads(user_id: str):
+    """Get tag relationships and evolution patterns"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get commonly co-occurring tags
+        cursor.execute("""
+            SELECT 
+                t1.name as tag1,
+                t2.name as tag2,
+                COUNT(*) as co_occurrences
+            FROM entry_tags et1
+            JOIN entry_tags et2 ON et1.message_id = et2.message_id AND et1.tag_id < et2.tag_id
+            JOIN tags t1 ON et1.tag_id = t1.id
+            JOIN tags t2 ON et2.tag_id = t2.id
+            JOIN messages m ON et1.message_id = m.id
+            WHERE m.user_id = ?
+            GROUP BY t1.name, t2.name
+            HAVING co_occurrences >= 3
+            ORDER BY co_occurrences DESC
+            LIMIT 20
+        """, (user_id,))
+        
+        tag_relationships = []
+        for row in cursor.fetchall():
+            tag_relationships.append({
+                "tags": [row["tag1"], row["tag2"]],
+                "strength": row["co_occurrences"]
+            })
+        
+        # Get tag evolution timeline
+        cursor.execute("""
+            SELECT 
+                t.name as tag,
+                COUNT(*) as usage_count,
+                MIN(m.timestamp) as first_seen,
+                MAX(m.timestamp) as last_seen,
+                julianday(MAX(m.timestamp)) - julianday(MIN(m.timestamp)) as days_active
+            FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            JOIN messages m ON et.message_id = m.id
+            WHERE m.user_id = ?
+            GROUP BY t.name
+            HAVING usage_count >= 3
+            ORDER BY first_seen
+        """, (user_id,))
+        
+        tag_timeline = []
+        for row in cursor.fetchall():
+            tag_timeline.append({
+                "tag": row["tag"],
+                "usage_count": row["usage_count"],
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+                "days_active": int(row["days_active"]),
+                "status": "active" if (datetime.utcnow() - datetime.fromisoformat(row["last_seen"].replace('Z', '+00:00'))).days < 30 else "dormant"
+            })
+        
+        # Identify tag clusters by category and usage patterns
+        cursor.execute("""
+            SELECT 
+                t.category,
+                GROUP_CONCAT(t.name) as tags,
+                COUNT(DISTINCT t.id) as tag_count,
+                COUNT(DISTINCT et.message_id) as total_uses
+            FROM tags t
+            JOIN entry_tags et ON t.id = et.tag_id
+            JOIN messages m ON et.message_id = m.id
+            WHERE m.user_id = ? AND t.category IS NOT NULL
+            GROUP BY t.category
+            ORDER BY total_uses DESC
+        """, (user_id,))
+        
+        tag_clusters = []
+        for row in cursor.fetchall():
+            tag_clusters.append({
+                "category": row["category"],
+                "tags": row["tags"].split(",") if row["tags"] else [],
+                "tag_count": row["tag_count"],
+                "total_uses": row["total_uses"]
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"🕸️ Retrieved sacred threads for user {user_id}")
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "tag_relationships": tag_relationships,
+            "tag_timeline": tag_timeline,
+            "tag_clusters": tag_clusters,
+            "insights": {
+                "total_relationships": len(tag_relationships),
+                "active_tags": sum(1 for t in tag_timeline if t["status"] == "active"),
+                "dormant_tags": sum(1 for t in tag_timeline if t["status"] == "dormant"),
+                "strongest_connection": tag_relationships[0] if tag_relationships else None
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Get sacred threads failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get sacred threads: {str(e)}")
 
 @app.get("/stats")
 async def get_stats():
