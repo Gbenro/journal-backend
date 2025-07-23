@@ -1614,6 +1614,177 @@ async def get_storage_information():
         logger.error(f"Storage info failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get storage info: {str(e)}")
 
+def column_exists(cursor, table_name, column_name):
+    """Check if a column exists in a table"""
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [row[1] for row in cursor.fetchall()]
+        return column_name in columns
+    except Exception as e:
+        logger.error(f"Error checking column {column_name} in {table_name}: {e}")
+        return False
+
+@app.post("/api/migrate-database")
+async def migrate_database():
+    """
+    Migrate database schema to add missing enhanced fluency columns
+    This endpoint fixes production databases missing the updated_at and other enhanced columns
+    """
+    try:
+        logger.info("🔧 Starting database migration for Mirror Scribe Enhanced Fluency...")
+        
+        migration_results = {
+            "success": True,
+            "migrations_applied": [],
+            "errors": [],
+            "database_path": get_database_path(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Define the columns we need to add
+        enhanced_columns = [
+            {
+                "name": "intention_flag",
+                "definition": "BOOLEAN DEFAULT FALSE",
+                "description": "Flag for marking entries as intentions"
+            },
+            {
+                "name": "manual_energy_signature", 
+                "definition": "TEXT",
+                "description": "Manually set energy signature override"
+            },
+            {
+                "name": "relationship_mentions",
+                "definition": "JSON",
+                "description": "JSON array of people mentioned in entry"
+            },
+            {
+                "name": "updated_at",
+                "definition": "TIMESTAMP",
+                "description": "Last modification timestamp"
+            },
+            {
+                "name": "revision_count",
+                "definition": "INTEGER DEFAULT 0", 
+                "description": "Number of revisions made to entry"
+            }
+        ]
+        
+        logger.info(f"📋 Checking for {len(enhanced_columns)} enhanced columns in messages table...")
+        
+        # Check and add each column
+        for column_info in enhanced_columns:
+            column_name = column_info["name"]
+            column_def = column_info["definition"]
+            description = column_info["description"]
+            
+            if column_exists(cursor, "messages", column_name):
+                logger.info(f"✅ Column '{column_name}' already exists - skipping")
+                migration_results["migrations_applied"].append({
+                    "column": column_name,
+                    "action": "skipped",
+                    "reason": "already_exists"
+                })
+            else:
+                try:
+                    logger.info(f"➕ Adding column '{column_name}': {description}")
+                    alter_sql = f"ALTER TABLE messages ADD COLUMN {column_name} {column_def}"
+                    cursor.execute(alter_sql)
+                    logger.info(f"✅ Successfully added column '{column_name}'")
+                    migration_results["migrations_applied"].append({
+                        "column": column_name,
+                        "action": "added",
+                        "definition": column_def,
+                        "description": description
+                    })
+                except Exception as e:
+                    error_msg = f"❌ Failed to add column '{column_name}': {e}"
+                    logger.error(error_msg)
+                    migration_results["errors"].append({
+                        "column": column_name,
+                        "error": str(e),
+                        "sql": alter_sql
+                    })
+                    migration_results["success"] = False
+        
+        # Update existing entries to have default values for new columns
+        if not migration_results["errors"]:
+            try:
+                logger.info("🔄 Updating existing entries with default values...")
+                
+                # Set default values for new columns where they might be NULL
+                cursor.execute("""
+                    UPDATE messages 
+                    SET 
+                        intention_flag = COALESCE(intention_flag, FALSE),
+                        revision_count = COALESCE(revision_count, 0),
+                        updated_at = COALESCE(updated_at, timestamp)
+                    WHERE intention_flag IS NULL OR revision_count IS NULL OR updated_at IS NULL
+                """)
+                
+                rows_updated = cursor.rowcount
+                logger.info(f"✅ Updated {rows_updated} existing entries with default values")
+                
+                migration_results["migrations_applied"].append({
+                    "action": "updated_defaults",
+                    "rows_affected": rows_updated,
+                    "description": "Set default values for existing entries"
+                })
+                
+            except Exception as e:
+                error_msg = f"❌ Failed to update default values: {e}"
+                logger.error(error_msg)
+                migration_results["errors"].append({
+                    "action": "update_defaults",
+                    "error": str(e)
+                })
+                migration_results["success"] = False
+        
+        # Commit all changes
+        if migration_results["success"]:
+            conn.commit()
+            logger.info("✅ Database migration completed successfully!")
+        else:
+            conn.rollback()
+            logger.warning("⚠️  Database migration completed with errors - changes rolled back")
+        
+        # Verify the migration
+        logger.info("🔍 Verifying migration results...")
+        for column_info in enhanced_columns:
+            column_name = column_info["name"]
+            if column_exists(cursor, "messages", column_name):
+                logger.info(f"✅ Verification: Column '{column_name}' exists")
+            else:
+                logger.error(f"❌ Verification failed: Column '{column_name}' missing")
+                migration_results["success"] = False
+        
+        # Get final database stats
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        total_entries = cursor.fetchone()[0]
+        
+        cursor.execute("PRAGMA table_info(messages)")
+        column_count = len(cursor.fetchall())
+        
+        migration_results["database_stats"] = {
+            "total_entries": total_entries,
+            "total_columns": column_count,
+            "database_size_bytes": os.path.getsize(get_database_path()) if os.path.exists(get_database_path()) else 0
+        }
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"🎉 Migration completed with {len(migration_results['migrations_applied'])} actions")
+        
+        return migration_results
+        
+    except Exception as e:
+        logger.error(f"Database migration failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to migrate database: {str(e)}")
+
 # Tag management endpoints
 @app.get("/api/tags")
 async def get_all_tags():
