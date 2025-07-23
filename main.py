@@ -169,6 +169,26 @@ class TagHierarchyRequest(BaseModel):
     child_tag_name: str
     relationship_type: Optional[str] = "subcategory"
 
+# Enhancement System models
+class InteractionLogCreate(BaseModel):
+    user_id: str
+    action_type: str
+    response_time: Optional[float] = None
+    success: Optional[bool] = True
+    error_message: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class EnhancementSuggestionCreate(BaseModel):
+    suggestion_id: str
+    title: str
+    description: str
+    category: str
+    priority: str
+    reasoning: str
+    triggered_by: str
+    user_context: Optional[Dict[str, Any]] = None
+    status: Optional[str] = "pending"
+
 # Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
 # Updated 2025-07-21: Enhanced keyword matching and confidence scoring
 class AutoTagger:
@@ -1316,6 +1336,39 @@ def init_database():
             )
         """)
         
+        # Create interaction_logs table for enhancement system
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS interaction_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                response_time FLOAT,
+                success BOOLEAN DEFAULT TRUE,
+                error_message TEXT,
+                metadata JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create enhancement_suggestions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS enhancement_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                reasoning TEXT NOT NULL,
+                triggered_by TEXT NOT NULL,
+                suggested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_context JSON,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Create indexes for performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_timestamp ON messages(user_id, timestamp)")
@@ -1331,6 +1384,12 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_connections_to ON entry_connections(to_entry_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_hierarchy_parent ON tag_hierarchy(parent_tag_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_hierarchy_child ON tag_hierarchy(child_tag_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_interaction_logs_user_id ON interaction_logs(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_interaction_logs_timestamp ON interaction_logs(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_interaction_logs_action_type ON interaction_logs(action_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_enhancement_suggestions_suggestion_id ON enhancement_suggestions(suggestion_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_enhancement_suggestions_priority ON enhancement_suggestions(priority)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_enhancement_suggestions_status ON enhancement_suggestions(status)")
         
         # Add enhanced columns to messages table if they don't exist
         try:
@@ -1784,6 +1843,118 @@ async def migrate_database():
     except Exception as e:
         logger.error(f"Database migration failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to migrate database: {str(e)}")
+
+@app.post("/api/migrate-enhancement-system")
+async def migrate_enhancement_system():
+    """
+    Migrate database to add enhancement system tables
+    Adds interaction_logs and enhancement_suggestions tables
+    """
+    try:
+        logger.info("🔧 Starting Enhancement System database migration...")
+        
+        migration_results = {
+            "success": True,
+            "tables_created": [],
+            "indexes_created": [],
+            "errors": [],
+            "database_path": get_database_path(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        def table_exists(table_name):
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name=?
+            """, (table_name,))
+            return cursor.fetchone() is not None
+        
+        # Create interaction_logs table
+        if not table_exists("interaction_logs"):
+            logger.info("📋 Creating interaction_logs table...")
+            cursor.execute("""
+                CREATE TABLE interaction_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    response_time FLOAT,
+                    success BOOLEAN DEFAULT TRUE,
+                    error_message TEXT,
+                    metadata JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            migration_results["tables_created"].append("interaction_logs")
+            logger.info("✅ Created interaction_logs table")
+        else:
+            logger.info("⏭️  Table interaction_logs already exists")
+        
+        # Create enhancement_suggestions table
+        if not table_exists("enhancement_suggestions"):
+            logger.info("📋 Creating enhancement_suggestions table...")
+            cursor.execute("""
+                CREATE TABLE enhancement_suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    suggestion_id TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    reasoning TEXT NOT NULL,
+                    triggered_by TEXT NOT NULL,
+                    suggested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_context JSON,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            migration_results["tables_created"].append("enhancement_suggestions")
+            logger.info("✅ Created enhancement_suggestions table")
+        else:
+            logger.info("⏭️  Table enhancement_suggestions already exists")
+        
+        # Create indexes
+        indexes = [
+            ("idx_interaction_logs_user_id", "interaction_logs(user_id)"),
+            ("idx_interaction_logs_timestamp", "interaction_logs(timestamp)"),
+            ("idx_interaction_logs_action_type", "interaction_logs(action_type)"),
+            ("idx_enhancement_suggestions_suggestion_id", "enhancement_suggestions(suggestion_id)"),
+            ("idx_enhancement_suggestions_priority", "enhancement_suggestions(priority)"),
+            ("idx_enhancement_suggestions_status", "enhancement_suggestions(status)")
+        ]
+        
+        for index_name, index_def in indexes:
+            try:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {index_def}")
+                migration_results["indexes_created"].append(index_name)
+            except Exception as e:
+                logger.warning(f"Index {index_name} may already exist: {e}")
+        
+        conn.commit()
+        
+        # Get stats
+        cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
+        total_tables = cursor.fetchone()[0]
+        
+        migration_results["database_stats"] = {
+            "total_tables": total_tables,
+            "database_size_bytes": os.path.getsize(get_database_path()) if os.path.exists(get_database_path()) else 0
+        }
+        
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"🎉 Enhancement System migration completed with {len(migration_results['tables_created'])} new tables")
+        
+        return migration_results
+        
+    except Exception as e:
+        logger.error(f"Enhancement System migration failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to migrate enhancement system: {str(e)}")
 
 # Tag management endpoints
 @app.get("/api/tags")
@@ -3198,6 +3369,223 @@ async def get_stats():
     except Exception as e:
         logger.error(f"Stats failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+# Enhancement System API Endpoints
+@app.post("/api/interactions")
+async def save_interaction_log(interaction: InteractionLogCreate):
+    """Save interaction log data to database"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO interaction_logs 
+            (user_id, action_type, response_time, success, error_message, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            interaction.user_id,
+            interaction.action_type,
+            interaction.response_time,
+            interaction.success,
+            interaction.error_message,
+            json.dumps(interaction.metadata) if interaction.metadata else None
+        ))
+        
+        log_id = cursor.lastrowid
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"📊 Saved interaction log {log_id} for user {interaction.user_id}: {interaction.action_type}")
+        
+        return {
+            "status": "success",
+            "id": log_id,
+            "message": "Interaction log saved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Save interaction log failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save interaction log: {str(e)}")
+
+@app.post("/api/enhancements")
+async def save_enhancement_suggestion(enhancement: EnhancementSuggestionCreate):
+    """Save enhancement suggestion to database"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO enhancement_suggestions 
+            (suggestion_id, title, description, category, priority, reasoning, 
+             triggered_by, user_context, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            enhancement.suggestion_id,
+            enhancement.title,
+            enhancement.description,
+            enhancement.category,
+            enhancement.priority,
+            enhancement.reasoning,
+            enhancement.triggered_by,
+            json.dumps(enhancement.user_context) if enhancement.user_context else None,
+            enhancement.status
+        ))
+        
+        suggestion_id = cursor.lastrowid
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"💡 Saved enhancement suggestion {enhancement.suggestion_id}: {enhancement.title}")
+        
+        return {
+            "status": "success",
+            "id": suggestion_id,
+            "suggestion_id": enhancement.suggestion_id,
+            "message": "Enhancement suggestion saved successfully"
+        }
+        
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"Enhancement suggestion with ID '{enhancement.suggestion_id}' already exists")
+    except Exception as e:
+        logger.error(f"Save enhancement suggestion failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save enhancement suggestion: {str(e)}")
+
+@app.get("/api/interactions/stats")
+async def get_interaction_stats(days: int = 7):
+    """Get interaction statistics for the last N days"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Calculate date range
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
+        
+        # Get total interactions
+        cursor.execute("""
+            SELECT COUNT(*) as total FROM interaction_logs
+            WHERE timestamp >= ?
+        """, (start_date.isoformat(),))
+        total_interactions = cursor.fetchone()["total"]
+        
+        # Get breakdown by action type
+        cursor.execute("""
+            SELECT action_type, COUNT(*) as count
+            FROM interaction_logs
+            WHERE timestamp >= ?
+            GROUP BY action_type
+            ORDER BY count DESC
+        """, (start_date.isoformat(),))
+        action_breakdown = {row["action_type"]: row["count"] for row in cursor.fetchall()}
+        
+        # Get success rate
+        cursor.execute("""
+            SELECT 
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful,
+                COUNT(*) as total
+            FROM interaction_logs
+            WHERE timestamp >= ?
+        """, (start_date.isoformat(),))
+        success_data = cursor.fetchone()
+        success_rate = (success_data["successful"] / success_data["total"] * 100) if success_data["total"] > 0 else 100.0
+        
+        # Get average response time
+        cursor.execute("""
+            SELECT AVG(response_time) as avg_response_time
+            FROM interaction_logs
+            WHERE timestamp >= ? AND response_time IS NOT NULL
+        """, (start_date.isoformat(),))
+        avg_response_time = cursor.fetchone()["avg_response_time"] or 0
+        
+        # Get interactions by day
+        cursor.execute("""
+            SELECT DATE(timestamp) as date, COUNT(*) as count
+            FROM interaction_logs
+            WHERE timestamp >= ?
+            GROUP BY DATE(timestamp)
+            ORDER BY date
+        """, (start_date.isoformat(),))
+        daily_interactions = [{"date": row["date"], "count": row["count"]} for row in cursor.fetchall()]
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "period_days": days,
+            "total_interactions": total_interactions,
+            "action_breakdown": action_breakdown,
+            "success_rate": round(success_rate, 2),
+            "average_response_time": round(avg_response_time, 2) if avg_response_time else 0,
+            "daily_interactions": daily_interactions,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Get interaction stats failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get interaction stats: {str(e)}")
+
+@app.get("/api/enhancements")
+async def get_enhancement_suggestions(
+    priority: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50
+):
+    """Get enhancement suggestions with optional filters"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Build query with optional filters
+        query = "SELECT * FROM enhancement_suggestions WHERE 1=1"
+        params = []
+        
+        if priority:
+            query += " AND priority = ?"
+            params.append(priority)
+        
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+        
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        
+        query += " ORDER BY suggested_at DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        suggestions = []
+        
+        for row in cursor.fetchall():
+            suggestion = dict(row)
+            # Parse JSON fields
+            if suggestion["user_context"]:
+                suggestion["user_context"] = json.loads(suggestion["user_context"])
+            suggestions.append(suggestion)
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "suggestions": suggestions,
+            "count": len(suggestions),
+            "filters": {
+                "priority": priority,
+                "category": category,
+                "status": status,
+                "limit": limit
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Get enhancement suggestions failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get enhancement suggestions: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
