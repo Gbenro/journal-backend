@@ -9,6 +9,11 @@ from datetime import datetime, timedelta
 import logging
 from typing import List, Optional, Dict, Any
 import json
+import pytz
+from temporal_awareness import (
+    TemporalSignalDetector, TemporalStateManager, TemporalSummaryGenerator,
+    create_temporal_tables, SignalType, TemporalSignal, TemporalState
+)
 
 # Configure logging - Last updated: 2025-07-21 for Railway deployment
 # This ensures proper logging across development and production environments
@@ -188,6 +193,25 @@ class EnhancementSuggestionCreate(BaseModel):
     triggered_by: str
     user_context: Optional[Dict[str, Any]] = None
     status: Optional[str] = "pending"
+
+# Temporal Awareness models
+class TemporalSignalCreate(BaseModel):
+    signal_type: str
+    confidence: float
+    detected_text: str
+    signal_timestamp: Optional[str] = None
+    entry_id: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class TemporalSignalDetectRequest(BaseModel):
+    content: str
+    entry_timestamp: Optional[str] = None
+
+class TemporalSummaryRequest(BaseModel):
+    user_id: str
+    period_type: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 # Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
 # Updated 2025-07-21: Enhanced keyword matching and confidence scoring
@@ -1427,7 +1451,10 @@ def init_database():
         cursor.close()
         conn.close()
         
-        logger.info(f"✅ Enhanced SQLite database with tags initialized successfully at: {db_path}")
+        # Create temporal awareness tables using the specialized function
+        create_temporal_tables(db_path)
+        
+        logger.info(f"✅ Enhanced SQLite database with tags and temporal awareness initialized successfully at: {db_path}")
         return True
         
     except Exception as e:
@@ -2126,14 +2153,33 @@ async def save_message(message: MessageRequest):
             entry_timestamp = datetime.utcnow().isoformat()
             relationship_analyzer.update_relationship_tracking(message.user_id, message_id, relationships, entry_timestamp)
         
-        logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags for user {message.user_id}")
+        # Automatic temporal signal detection on entry storage
+        detected_signals = []
+        try:
+            signals = signal_detector.detect_signals(message.content, datetime.utcnow())
+            for signal in signals:
+                # Record temporal signal
+                state_manager.record_temporal_signal(message.user_id, signal, message_id)
+                detected_signals.append({
+                    "signal_type": signal.signal_type.value,
+                    "confidence": signal.confidence,
+                    "detected_text": signal.detected_text
+                })
+                logger.info(f"📅 Auto-detected temporal signal: {signal.signal_type.value} (confidence: {signal.confidence:.2f})")
+        except Exception as e:
+            logger.warning(f"Temporal signal detection failed: {e}")
+            # Don't fail the entry save if temporal detection fails
+        
+        logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags and {len(detected_signals)} temporal signals for user {message.user_id}")
         
         return {
             "status": "success",
             "message_id": message_id,
             "timestamp": datetime.utcnow().isoformat(),
             "applied_tags": applied_tags,
-            "tag_count": len(applied_tags)
+            "tag_count": len(applied_tags),
+            "temporal_signals": detected_signals,
+            "temporal_signal_count": len(detected_signals)
         }
         
     except Exception as e:
@@ -3587,8 +3633,321 @@ async def get_enhancement_suggestions(
         logger.error(f"Get enhancement suggestions failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get enhancement suggestions: {str(e)}")
 
+# ========================================
+# TEMPORAL AWARENESS API ENDPOINTS
+# ========================================
+
+# Initialize temporal awareness components
+signal_detector = TemporalSignalDetector()
+state_manager = TemporalStateManager(DATABASE_FILE)
+summary_generator = TemporalSummaryGenerator(DATABASE_FILE)
+
+@app.post("/api/temporal/mark-signal")
+async def mark_temporal_signal(user_id: str, signal_data: TemporalSignalCreate):
+    """Mark a detected temporal boundary signal"""
+    try:
+        logger.info(f"📅 Marking temporal signal for user {user_id}: {signal_data.signal_type}")
+        
+        # Parse timestamp if provided
+        signal_timestamp = datetime.now()
+        if signal_data.signal_timestamp:
+            try:
+                signal_timestamp = datetime.fromisoformat(signal_data.signal_timestamp)
+            except ValueError:
+                signal_timestamp = datetime.now()
+        
+        # Create temporal signal object
+        signal = TemporalSignal(
+            signal_type=SignalType(signal_data.signal_type),
+            confidence=signal_data.confidence,
+            detected_text=signal_data.detected_text,
+            signal_timestamp=signal_timestamp,
+            entry_id=signal_data.entry_id,
+            metadata=signal_data.metadata
+        )
+        
+        # Record the signal
+        state_manager.record_temporal_signal(user_id, signal, signal_data.entry_id)
+        
+        return {
+            "status": "success",
+            "message": "Temporal signal marked successfully",
+            "signal_type": signal_data.signal_type,
+            "confidence": signal_data.confidence,
+            "timestamp": signal_timestamp.isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Mark temporal signal failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark temporal signal: {str(e)}")
+
+@app.get("/api/temporal/state/{user_id}")
+async def get_temporal_state(user_id: str):
+    """Get current temporal state for user"""
+    try:
+        logger.info(f"🔍 Getting temporal state for user {user_id}")
+        
+        temporal_state = state_manager.get_temporal_state(user_id)
+        
+        return {
+            "status": "success",
+            "user_id": temporal_state.user_id,
+            "timezone": temporal_state.timezone,
+            "boundaries": {
+                "last_day_start": temporal_state.last_day_start.isoformat() if temporal_state.last_day_start else None,
+                "last_day_end": temporal_state.last_day_end.isoformat() if temporal_state.last_day_end else None,
+                "last_week_start": temporal_state.last_week_start.isoformat() if temporal_state.last_week_start else None,
+                "last_week_end": temporal_state.last_week_end.isoformat() if temporal_state.last_week_end else None,
+                "last_month_start": temporal_state.last_month_start.isoformat() if temporal_state.last_month_start else None,
+                "last_month_end": temporal_state.last_month_end.isoformat() if temporal_state.last_month_end else None,
+                "last_year_start": temporal_state.last_year_start.isoformat() if temporal_state.last_year_start else None,
+                "last_year_end": temporal_state.last_year_end.isoformat() if temporal_state.last_year_end else None,
+            },
+            "updated_at": temporal_state.updated_at.isoformat() if temporal_state.updated_at else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Get temporal state failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get temporal state: {str(e)}")
+
+@app.post("/api/temporal/detect-signals")
+async def detect_temporal_signals(detect_request: TemporalSignalDetectRequest):
+    """Analyze entry content for temporal signals"""
+    try:
+        logger.info(f"🔍 Detecting temporal signals in content")
+        
+        # Parse timestamp if provided
+        entry_timestamp = datetime.now()
+        if detect_request.entry_timestamp:
+            try:
+                entry_timestamp = datetime.fromisoformat(detect_request.entry_timestamp)
+            except ValueError:
+                entry_timestamp = datetime.now()
+        
+        # Detect signals
+        signals = signal_detector.detect_signals(detect_request.content, entry_timestamp)
+        
+        # Convert signals to response format
+        detected_signals = []
+        for signal in signals:
+            detected_signals.append({
+                "signal_type": signal.signal_type.value,
+                "confidence": signal.confidence,
+                "detected_text": signal.detected_text,
+                "signal_timestamp": signal.signal_timestamp.isoformat(),
+                "metadata": signal.metadata
+            })
+        
+        return {
+            "status": "success",
+            "content_analyzed": True,
+            "signals_found": len(detected_signals),
+            "signals": detected_signals,
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Detect temporal signals failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to detect temporal signals: {str(e)}")
+
+@app.get("/api/temporal/summary/{user_id}")
+async def generate_temporal_summary(user_id: str, period_type: str = "weekly", 
+                                  start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """Generate a temporal period summary"""
+    try:
+        logger.info(f"📊 Generating {period_type} temporal summary for user {user_id}")
+        
+        # Calculate period dates if not provided
+        if not start_date or not end_date:
+            now = datetime.now()
+            user_tz = state_manager.get_user_timezone(user_id)
+            
+            if period_type == "daily":
+                start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+            elif period_type == "weekly":
+                # Get start of week (Monday)
+                days_since_monday = now.weekday()
+                start_date = now - timedelta(days=days_since_monday)
+                start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59)
+            elif period_type == "monthly":
+                start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                # Get last day of month
+                if now.month == 12:
+                    next_month = now.replace(year=now.year + 1, month=1, day=1)
+                else:
+                    next_month = now.replace(month=now.month + 1, day=1)
+                end_date = next_month - timedelta(days=1)
+                end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            else:
+                raise HTTPException(status_code=400, detail="Invalid period_type. Use: daily, weekly, monthly")
+        else:
+            # Parse provided dates
+            try:
+                start_date = datetime.fromisoformat(start_date)
+                end_date = datetime.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format: YYYY-MM-DDTHH:MM:SS")
+        
+        # Generate summary
+        summary = summary_generator.generate_period_summary(user_id, period_type, start_date, end_date)
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Generate temporal summary failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate temporal summary: {str(e)}")
+
+@app.get("/api/temporal/missing-signals/{user_id}")
+async def get_missing_temporal_signals(user_id: str, days_back: int = 7):
+    """Suggest missing temporal boundaries based on recent activity"""
+    try:
+        logger.info(f"🔍 Analyzing missing temporal signals for user {user_id}")
+        
+        # Get temporal state
+        temporal_state = state_manager.get_temporal_state(user_id)
+        now = datetime.now()
+        cutoff_date = now - timedelta(days=days_back)
+        
+        # Analyze missing signals
+        missing_signals = []
+        suggestions = []
+        
+        # Check for missing day boundaries
+        if not temporal_state.last_day_start or temporal_state.last_day_start < cutoff_date:
+            missing_signals.append("day_start")
+            suggestions.append({
+                "signal_type": "day_start",
+                "suggestion": "Consider marking the beginning of your day with a morning reflection",
+                "confidence": 0.7,
+                "urgency": "medium"
+            })
+        
+        if not temporal_state.last_day_end or temporal_state.last_day_end < cutoff_date:
+            missing_signals.append("day_end")
+            suggestions.append({
+                "signal_type": "day_end",
+                "suggestion": "Evening reflections can help close your day with intention",
+                "confidence": 0.7,
+                "urgency": "medium"
+            })
+        
+        # Check for missing week boundaries
+        if not temporal_state.last_week_start or temporal_state.last_week_start < (now - timedelta(weeks=2)):
+            missing_signals.append("week_start")
+            suggestions.append({
+                "signal_type": "week_start",
+                "suggestion": "Weekly planning and intention-setting can enhance your awareness",
+                "confidence": 0.6,
+                "urgency": "low"
+            })
+        
+        # Check for missing month boundaries
+        if not temporal_state.last_month_start or temporal_state.last_month_start < (now - timedelta(days=60)):
+            missing_signals.append("month_start")
+            suggestions.append({
+                "signal_type": "month_start",
+                "suggestion": "Monthly reflections provide valuable perspective on your growth",
+                "confidence": 0.5,
+                "urgency": "low"
+            })
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "analysis_period_days": days_back,
+            "missing_signals": missing_signals,
+            "suggestions": suggestions,
+            "temporal_awareness_score": len(missing_signals) / 8.0,  # 8 possible boundary types
+            "analyzed_at": now.isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Get missing temporal signals failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze missing temporal signals: {str(e)}")
+
+# Background service endpoint for scheduled boundary detection
+@app.post("/api/temporal/auto-detect-boundaries")
+async def auto_detect_temporal_boundaries():
+    """Automatically detect and mark temporal boundaries (for scheduled execution)"""
+    try:
+        logger.info("🕐 Running automatic temporal boundary detection")
+        
+        now = datetime.now()
+        detected_boundaries = []
+        
+        # Check for natural temporal boundaries
+        # This would typically be called by a scheduled service
+        
+        # Day boundaries
+        if now.hour == 0 and now.minute < 5:  # Early morning
+            detected_boundaries.append({
+                "boundary_type": "day_start",
+                "timestamp": now.isoformat(),
+                "confidence": 1.0,
+                "automatic": True
+            })
+        elif now.hour == 23 and now.minute > 55:  # Late evening
+            detected_boundaries.append({
+                "boundary_type": "day_end",
+                "timestamp": now.isoformat(),
+                "confidence": 1.0,
+                "automatic": True
+            })
+        
+        # Week boundaries (Monday morning)
+        if now.weekday() == 0 and now.hour < 12:  # Monday before noon
+            detected_boundaries.append({
+                "boundary_type": "week_start",
+                "timestamp": now.isoformat(),
+                "confidence": 0.9,
+                "automatic": True
+            })
+        elif now.weekday() == 6 and now.hour > 18:  # Sunday evening
+            detected_boundaries.append({
+                "boundary_type": "week_end",
+                "timestamp": now.isoformat(),
+                "confidence": 0.9,
+                "automatic": True
+            })
+        
+        # Month boundaries
+        if now.day == 1 and now.hour < 12:  # First day of month
+            detected_boundaries.append({
+                "boundary_type": "month_start",
+                "timestamp": now.isoformat(),
+                "confidence": 0.8,
+                "automatic": True
+            })
+        elif now.day >= 28:  # Last few days of month
+            # Check if tomorrow is the first day of next month
+            tomorrow = now + timedelta(days=1)
+            if tomorrow.day == 1:
+                detected_boundaries.append({
+                    "boundary_type": "month_end",
+                    "timestamp": now.isoformat(),
+                    "confidence": 0.8,
+                    "automatic": True
+                })
+        
+        return {
+            "status": "success",
+            "detected_boundaries": detected_boundaries,
+            "detection_timestamp": now.isoformat(),
+            "automatic_detection": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Auto-detect temporal boundaries failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to auto-detect temporal boundaries: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting enhanced tagging server on port {port}")
+    logger.info(f"🚀 Starting enhanced journaling server with temporal awareness on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
