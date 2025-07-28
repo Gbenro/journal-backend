@@ -14,6 +14,10 @@ from temporal_awareness import (
     TemporalSignalDetector, TemporalStateManager, TemporalSummaryGenerator,
     create_temporal_tables, SignalType, TemporalSignal, TemporalState
 )
+from timestamp_synchronization import (
+    TimezoneManager, TimestampSynchronizer, TemporalValidator,
+    create_timestamp_tables, TimestampInfo, TimestampSource, ValidationResult
+)
 
 # Configure logging - Last updated: 2025-07-21 for Railway deployment
 # This ensures proper logging across development and production environments
@@ -212,6 +216,29 @@ class TemporalSummaryRequest(BaseModel):
     period_type: str
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+
+# Timestamp Synchronization models
+class TimestampOverrideRequest(BaseModel):
+    entry_id: int
+    new_timestamp: str
+    timezone_name: Optional[str] = None
+    reason: Optional[str] = ""
+
+class TimezoneUpdateRequest(BaseModel):
+    user_id: str
+    timezone_name: str
+
+class BulkTimestampCorrectionRequest(BaseModel):
+    user_id: str
+    new_timezone: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    reason: Optional[str] = ""
+
+class TimestampValidationRequest(BaseModel):
+    content: str
+    timestamp: Optional[str] = None
+    timezone_name: Optional[str] = None
 
 # Auto-tagging engine - Intelligent content analysis for automatic tag suggestions
 # Updated 2025-07-21: Enhanced keyword matching and confidence scoring
@@ -1454,7 +1481,10 @@ def init_database():
         # Create temporal awareness tables using the specialized function
         create_temporal_tables(db_path)
         
-        logger.info(f"✅ Enhanced SQLite database with tags and temporal awareness initialized successfully at: {db_path}")
+        # Create timestamp synchronization tables
+        create_timestamp_tables(db_path)
+        
+        logger.info(f"✅ Enhanced SQLite database with tags, temporal awareness, and timestamp synchronization initialized successfully at: {db_path}")
         return True
         
     except Exception as e:
@@ -2100,17 +2130,39 @@ async def suggest_tags(request: TagSuggestionRequest):
         raise HTTPException(status_code=500, detail=f"Failed to get tag suggestions: {str(e)}")
 
 @app.post("/api/save")
-async def save_message(message: MessageRequest):
-    """Save a journal entry with enhanced tag support"""
+async def save_message(message: MessageRequest, client_timestamp: Optional[str] = None, 
+                      client_timezone: Optional[str] = None):
+    """Save a journal entry with enhanced tag support and timestamp synchronization"""
     try:
+        # Create comprehensive timestamp information
+        timestamp_info = timestamp_synchronizer.create_timestamp_info(
+            content=message.content,
+            user_id=message.user_id,
+            client_timestamp=client_timestamp,
+            client_timezone=client_timezone,
+            timestamp_source=TimestampSource.CLIENT_PROVIDED if client_timestamp else TimestampSource.AUTO
+        )
+        
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Insert message
-        cursor.execute(
-            "INSERT INTO messages (content, user_id, timestamp) VALUES (?, ?, ?)",
-            (message.content, message.user_id, datetime.utcnow().isoformat())
-        )
+        # Insert message with dual timestamp system
+        cursor.execute("""
+            INSERT INTO messages (
+                content, user_id, timestamp, 
+                utc_timestamp, local_timestamp, timezone_at_creation,
+                timestamp_source, temporal_validation_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            message.content, 
+            message.user_id, 
+            timestamp_info.utc_timestamp.isoformat(),  # Legacy timestamp field
+            timestamp_info.utc_timestamp.isoformat(),
+            timestamp_info.local_timestamp.isoformat(),
+            timestamp_info.timezone_name,
+            timestamp_info.timestamp_source.value,
+            timestamp_info.validation_score
+        ))
         
         message_id = cursor.lastrowid
         
@@ -2156,7 +2208,7 @@ async def save_message(message: MessageRequest):
         # Automatic temporal signal detection on entry storage
         detected_signals = []
         try:
-            signals = signal_detector.detect_signals(message.content, datetime.utcnow())
+            signals = signal_detector.detect_signals(message.content, timestamp_info.utc_timestamp)
             for signal in signals:
                 # Record temporal signal
                 state_manager.record_temporal_signal(message.user_id, signal, message_id)
@@ -2175,7 +2227,12 @@ async def save_message(message: MessageRequest):
         return {
             "status": "success",
             "message_id": message_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": timestamp_info.utc_timestamp.isoformat(),
+            "local_timestamp": timestamp_info.local_timestamp.isoformat(),
+            "timezone": timestamp_info.timezone_name,
+            "timestamp_source": timestamp_info.timestamp_source.value,
+            "temporal_validation_score": timestamp_info.validation_score,
+            "validation_notes": timestamp_info.validation_notes,
             "applied_tags": applied_tags,
             "tag_count": len(applied_tags),
             "temporal_signals": detected_signals,
@@ -2187,11 +2244,16 @@ async def save_message(message: MessageRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save message: {str(e)}")
 
 @app.get("/api/messages/{user_id}")
-async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Optional[str] = None):
-    """Get messages for a user with optional tag filtering"""
+async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Optional[str] = None,
+                      use_local_time: bool = True):
+    """Get messages for a user with optional tag filtering and timezone-aware timestamps"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Choose timestamp field based on preference
+        timestamp_field = "local_timestamp" if use_local_time else "utc_timestamp"
+        fallback_field = "timestamp"  # Legacy fallback
         
         if tags:
             # Filter by tags
@@ -2199,31 +2261,55 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
             placeholders = ",".join("?" * len(tag_list))
             
             cursor.execute(f"""
-                SELECT DISTINCT m.id, m.content, m.user_id, m.timestamp
+                SELECT DISTINCT m.id, m.content, m.user_id, 
+                       COALESCE(m.{timestamp_field}, m.{fallback_field}) as display_timestamp,
+                       m.utc_timestamp, m.local_timestamp, m.timezone_at_creation,
+                       m.temporal_validation_score, m.timestamp_source
                 FROM messages m
                 JOIN entry_tags et ON m.id = et.message_id
                 JOIN tags t ON et.tag_id = t.id
                 WHERE m.user_id = ? AND t.name IN ({placeholders})
-                ORDER BY m.timestamp DESC
+                ORDER BY COALESCE(m.{timestamp_field}, m.{fallback_field}) DESC
                 LIMIT ? OFFSET ?
             """, [user_id] + tag_list + [limit, offset])
         else:
             # Get all messages
-            cursor.execute(
-                """SELECT id, content, user_id, timestamp 
-                   FROM messages 
-                   WHERE user_id = ? 
-                   ORDER BY timestamp DESC 
-                   LIMIT ? OFFSET ?""",
-                (user_id, limit, offset)
-            )
+            cursor.execute(f"""
+                SELECT id, content, user_id, 
+                       COALESCE({timestamp_field}, {fallback_field}) as display_timestamp,
+                       utc_timestamp, local_timestamp, timezone_at_creation,
+                       temporal_validation_score, timestamp_source
+                FROM messages 
+                WHERE user_id = ? 
+                ORDER BY COALESCE({timestamp_field}, {fallback_field}) DESC 
+                LIMIT ? OFFSET ?
+            """, (user_id, limit, offset))
         
         rows = cursor.fetchall()
         
         # Get tags for each message
         messages = []
         for row in rows:
-            message = dict(row)
+            # Convert row to dict, handling new timestamp fields
+            if len(row) >= 8:  # Enhanced format with timestamp sync data
+                message = {
+                    "id": row[0],
+                    "content": row[1],
+                    "user_id": row[2],
+                    "timestamp": row[3],  # Display timestamp
+                    "utc_timestamp": row[4],
+                    "local_timestamp": row[5],
+                    "timezone": row[6],
+                    "temporal_validation_score": row[7],
+                    "timestamp_source": row[8]
+                }
+            else:  # Legacy format
+                message = {
+                    "id": row[0],
+                    "content": row[1],
+                    "user_id": row[2],
+                    "timestamp": row[3]
+                }
             
             # Get tags for this message
             cursor.execute("""
@@ -2240,13 +2326,14 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
         cursor.close()
         conn.close()
         
-        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id}")
+        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id} (using {'local' if use_local_time else 'UTC'} time)")
         
         return {
             "status": "success",
             "messages": messages,
             "count": len(messages),
-            "filtered_by_tags": tags.split(",") if tags else None
+            "filtered_by_tags": tags.split(",") if tags else None,
+            "timestamp_mode": "local" if use_local_time else "utc"
         }
         
     except Exception as e:
@@ -3642,6 +3729,11 @@ signal_detector = TemporalSignalDetector()
 state_manager = TemporalStateManager(DATABASE_FILE)
 summary_generator = TemporalSummaryGenerator(DATABASE_FILE)
 
+# Initialize timestamp synchronization components
+timezone_manager = TimezoneManager()
+timestamp_synchronizer = TimestampSynchronizer(DATABASE_FILE)
+temporal_validator = TemporalValidator(DATABASE_FILE)
+
 @app.post("/api/temporal/mark-signal")
 async def mark_temporal_signal(user_id: str, signal_data: TemporalSignalCreate):
     """Mark a detected temporal boundary signal"""
@@ -3946,8 +4038,254 @@ async def auto_detect_temporal_boundaries():
         logger.error(f"Auto-detect temporal boundaries failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to auto-detect temporal boundaries: {str(e)}")
 
+# ========================================
+# TIMESTAMP SYNCHRONIZATION API ENDPOINTS
+# ========================================
+
+@app.post("/api/timestamp/override")
+async def override_entry_timestamp(request: TimestampOverrideRequest):
+    """Override an entry's timestamp with manual correction"""
+    try:
+        logger.info(f"⏰ Overriding timestamp for entry {request.entry_id}")
+        
+        # Get user_id from entry
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM messages WHERE id = ?", (request.entry_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Entry not found")
+        
+        user_id = result[0]
+        
+        # Determine timezone
+        timezone_name = request.timezone_name or timezone_manager.get_user_timezone(DATABASE_FILE, user_id)
+        
+        # Override timestamp
+        success = timestamp_synchronizer.override_timestamp(
+            entry_id=request.entry_id,
+            new_timestamp=request.new_timestamp,
+            timezone_name=timezone_name,
+            user_id=user_id,
+            reason=request.reason or "Manual override"
+        )
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Timestamp overridden successfully",
+                "entry_id": request.entry_id,
+                "new_timestamp": request.new_timestamp,
+                "timezone": timezone_name,
+                "reason": request.reason
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to override timestamp")
+            
+    except Exception as e:
+        logger.error(f"Timestamp override failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to override timestamp: {str(e)}")
+
+@app.put("/api/timestamp/validate")
+async def validate_timestamp(request: TimestampValidationRequest):
+    """Validate a timestamp against content and user patterns"""
+    try:
+        logger.info("🔍 Validating timestamp against content")
+        
+        # Parse timestamp
+        if request.timestamp:
+            timestamp = datetime.fromisoformat(request.timestamp)
+        else:
+            timestamp = datetime.utcnow()
+        
+        # Default timezone if not provided
+        timezone_name = request.timezone_name or "America/Chicago"
+        
+        # For validation, we need a user_id - this would normally come from auth
+        # For now, use a default validation without user patterns
+        validation = temporal_validator.validate_entry_timestamp(
+            content=request.content,
+            timestamp=timestamp,
+            timezone_name=timezone_name,
+            user_id="validation_user"  # Placeholder
+        )
+        
+        return {
+            "status": "success",
+            "validation": {
+                "severity": validation.severity.value,
+                "confidence": validation.confidence,
+                "message": validation.message,
+                "suggested_correction": validation.suggested_correction,
+                "metadata": validation.metadata
+            },
+            "timestamp_analyzed": timestamp.isoformat(),
+            "timezone": timezone_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Timestamp validation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to validate timestamp: {str(e)}")
+
+@app.put("/api/user/{user_id}/timezone")
+async def update_user_timezone(user_id: str, request: TimezoneUpdateRequest):
+    """Update user's timezone preference"""
+    try:
+        logger.info(f"🌍 Updating timezone for user {user_id} to {request.timezone_name}")
+        
+        # Validate timezone
+        if not timezone_manager.validate_timezone(request.timezone_name):
+            suggestions = timezone_manager.get_timezone_suggestions(request.timezone_name)
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid timezone: {request.timezone_name}. Suggestions: {suggestions[:5]}"
+            )
+        
+        # Update timezone
+        success = timezone_manager.set_user_timezone(DATABASE_FILE, user_id, request.timezone_name)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Timezone updated successfully",
+                "user_id": user_id,
+                "new_timezone": request.timezone_name
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update timezone")
+            
+    except Exception as e:
+        logger.error(f"Timezone update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update timezone: {str(e)}")
+
+@app.post("/api/timestamp/bulk-correct")
+async def bulk_correct_timestamps(request: BulkTimestampCorrectionRequest):
+    """Bulk correct timestamps for timezone changes"""
+    try:
+        logger.info(f"📦 Bulk correcting timestamps for user {request.user_id}")
+        
+        # Validate timezone
+        if not timezone_manager.validate_timezone(request.new_timezone):
+            raise HTTPException(status_code=400, detail=f"Invalid timezone: {request.new_timezone}")
+        
+        # Prepare date range
+        date_range = None
+        if request.start_date and request.end_date:
+            date_range = (request.start_date, request.end_date)
+        
+        # Perform bulk correction
+        result = timestamp_synchronizer.bulk_correct_timestamps(
+            user_id=request.user_id,
+            timezone_correction=request.new_timezone,
+            date_range=date_range
+        )
+        
+        return {
+            "status": "success" if result["success"] else "error",
+            "corrections_made": result["corrections_made"],
+            "total_entries": result.get("total_entries", 0),
+            "errors": result.get("errors", []),
+            "new_timezone": request.new_timezone,
+            "date_range": date_range,
+            "reason": request.reason
+        }
+        
+    except Exception as e:
+        logger.error(f"Bulk timestamp correction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to bulk correct timestamps: {str(e)}")
+
+@app.get("/api/timezone/suggestions")
+async def get_timezone_suggestions(partial_name: Optional[str] = None, country_code: Optional[str] = None):
+    """Get timezone suggestions"""
+    try:
+        suggestions = timezone_manager.get_timezone_suggestions(partial_name, country_code)
+        
+        return {
+            "status": "success",
+            "suggestions": suggestions,
+            "query": {
+                "partial_name": partial_name,
+                "country_code": country_code
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Timezone suggestions failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get timezone suggestions: {str(e)}")
+
+@app.get("/api/timestamp/validation-report/{user_id}")
+async def get_validation_report(user_id: str, days_back: int = 7, min_score: float = 0.5):
+    """Get timestamp validation report for entries with low confidence scores"""
+    try:
+        logger.info(f"📊 Generating validation report for user {user_id}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get entries with low validation scores
+        cutoff_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+        
+        cursor.execute("""
+            SELECT id, content, utc_timestamp, local_timestamp, timezone_at_creation,
+                   temporal_validation_score, timestamp_source
+            FROM messages 
+            WHERE user_id = ? AND utc_timestamp > ? AND temporal_validation_score < ?
+            ORDER BY temporal_validation_score ASC, utc_timestamp DESC
+            LIMIT 20
+        """, (user_id, cutoff_date, min_score))
+        
+        entries = cursor.fetchall()
+        conn.close()
+        
+        validation_issues = []
+        for entry in entries:
+            entry_id, content, utc_ts, local_ts, timezone_name, score, source = entry
+            
+            # Re-validate entry
+            try:
+                utc_dt = datetime.fromisoformat(utc_ts)
+                validation = temporal_validator.validate_entry_timestamp(
+                    content, utc_dt, timezone_name, user_id
+                )
+                
+                validation_issues.append({
+                    "entry_id": entry_id,
+                    "content_preview": content[:100] + "..." if len(content) > 100 else content,
+                    "utc_timestamp": utc_ts,
+                    "local_timestamp": local_ts,
+                    "timezone": timezone_name,
+                    "validation_score": score,
+                    "timestamp_source": source,
+                    "current_validation": {
+                        "severity": validation.severity.value,
+                        "confidence": validation.confidence,
+                        "message": validation.message
+                    }
+                })
+            except Exception as e:
+                validation_issues.append({
+                    "entry_id": entry_id,
+                    "error": f"Re-validation failed: {str(e)}"
+                })
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "analysis_period_days": days_back,
+            "min_validation_score": min_score,
+            "issues_found": len(validation_issues),
+            "validation_issues": validation_issues,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Validation report failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate validation report: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting enhanced journaling server with temporal awareness on port {port}")
+    logger.info(f"🚀 Starting enhanced journaling server with temporal awareness and timestamp synchronization on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
