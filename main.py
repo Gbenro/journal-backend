@@ -24,6 +24,102 @@ from timestamp_synchronization import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class TemporalQueryBuilder:
+    """Utility class for building temporal queries with advanced filtering"""
+    
+    @staticmethod
+    def parse_relative_period(relative_period: str, timezone_name: str = "UTC") -> tuple[datetime, datetime]:
+        """Parse relative period strings into start and end dates"""
+        tz = pytz.timezone(timezone_name)
+        now = datetime.now(tz)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if relative_period == "today":
+            start_date = today
+            end_date = today.replace(hour=23, minute=59, second=59)
+        elif relative_period == "yesterday":
+            start_date = today - timedelta(days=1)
+            end_date = start_date.replace(hour=23, minute=59, second=59)
+        elif relative_period == "last_7_days":
+            start_date = today - timedelta(days=6)
+            end_date = today.replace(hour=23, minute=59, second=59)
+        elif relative_period == "last_30_days":
+            start_date = today - timedelta(days=29)
+            end_date = today.replace(hour=23, minute=59, second=59)
+        elif relative_period == "this_week":
+            days_since_monday = now.weekday()
+            start_date = today - timedelta(days=days_since_monday)
+            end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        elif relative_period == "last_week":
+            days_since_monday = now.weekday()
+            this_week_monday = today - timedelta(days=days_since_monday)
+            start_date = this_week_monday - timedelta(days=7)
+            end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        elif relative_period == "this_month":
+            start_date = today.replace(day=1)
+            next_month = start_date.replace(month=start_date.month + 1) if start_date.month < 12 else start_date.replace(year=start_date.year + 1, month=1)
+            end_date = next_month - timedelta(seconds=1)
+        elif relative_period == "last_month":
+            first_of_this_month = today.replace(day=1)
+            end_date = first_of_this_month - timedelta(seconds=1)
+            start_date = end_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            raise ValueError(f"Unsupported relative period: {relative_period}")
+        
+        return start_date.astimezone(pytz.UTC), end_date.astimezone(pytz.UTC)
+    
+    @staticmethod
+    def build_temporal_where_clause(temporal_filter: TemporalFilterRequest, user_timezone: str = "UTC") -> tuple[str, list]:
+        """Build WHERE clause and parameters for temporal filtering"""
+        conditions = []
+        params = []
+        
+        # Handle date range filtering
+        if temporal_filter.start_date or temporal_filter.end_date:
+            if temporal_filter.start_date:
+                start_dt = datetime.fromisoformat(temporal_filter.start_date.replace('Z', '+00:00'))
+                conditions.append("COALESCE(local_timestamp, timestamp) >= ?")
+                params.append(start_dt.isoformat())
+            
+            if temporal_filter.end_date:
+                end_dt = datetime.fromisoformat(temporal_filter.end_date.replace('Z', '+00:00'))
+                conditions.append("COALESCE(local_timestamp, timestamp) <= ?")
+                params.append(end_dt.isoformat())
+        
+        # Handle relative period filtering
+        elif temporal_filter.relative_period:
+            try:
+                tz = temporal_filter.timezone_override or user_timezone
+                start_dt, end_dt = TemporalQueryBuilder.parse_relative_period(temporal_filter.relative_period, tz)
+                conditions.append("COALESCE(local_timestamp, timestamp) BETWEEN ? AND ?")
+                params.extend([start_dt.isoformat(), end_dt.isoformat()])
+            except ValueError as e:
+                logger.warning(f"Invalid relative period: {e}")
+        
+        # Handle time of day filtering
+        if temporal_filter.time_of_day_start or temporal_filter.time_of_day_end:
+            if temporal_filter.time_of_day_start:
+                conditions.append("strftime('%H:%M', COALESCE(local_timestamp, timestamp)) >= ?")
+                params.append(temporal_filter.time_of_day_start)
+            
+            if temporal_filter.time_of_day_end:
+                conditions.append("strftime('%H:%M', COALESCE(local_timestamp, timestamp)) <= ?")
+                params.append(temporal_filter.time_of_day_end)
+        
+        # Handle days of week filtering
+        if temporal_filter.days_of_week:
+            # SQLite strftime('%w') returns 0=Sunday, 1=Monday, etc.
+            day_conditions = []
+            for day in temporal_filter.days_of_week:
+                day_conditions.append("strftime('%w', COALESCE(local_timestamp, timestamp)) = ?")
+                params.append(str(day))
+            
+            if day_conditions:
+                conditions.append(f"({' OR '.join(day_conditions)})")
+        
+        where_clause = " AND ".join(conditions) if conditions else ""
+        return where_clause, params
+
 app = FastAPI(title="Journaling Backend with Tags")
 
 # CORS middleware
@@ -148,6 +244,16 @@ class TagSuggestionRequest(BaseModel):
 class SummaryGenerateRequest(BaseModel):
     user_id: str
     target_date: Optional[str] = None
+
+class TemporalFilterRequest(BaseModel):
+    """Request model for temporal filtering of messages"""
+    start_date: Optional[str] = None  # ISO format date string
+    end_date: Optional[str] = None    # ISO format date string
+    relative_period: Optional[str] = None  # "last_7_days", "this_week", "this_month", etc.
+    time_of_day_start: Optional[str] = None  # "08:00" format
+    time_of_day_end: Optional[str] = None    # "20:00" format
+    days_of_week: Optional[List[int]] = None  # [0-6] where 0=Sunday
+    timezone_override: Optional[str] = None   # Timezone to use for filtering
 
 # Enhanced fluency models
 class EntryUpdateRequest(BaseModel):
@@ -1442,6 +1548,35 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_enhancement_suggestions_priority ON enhancement_suggestions(priority)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_enhancement_suggestions_status ON enhancement_suggestions(status)")
         
+        # Enhanced temporal indexes for optimal time-based queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_local_timestamp ON messages(local_timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_utc_timestamp ON messages(utc_timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_temporal_validation ON messages(temporal_validation_score)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timezone ON messages(timezone_at_creation)")
+        
+        # Composite temporal indexes for complex queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_local_time ON messages(user_id, COALESCE(local_timestamp, timestamp))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_utc_time ON messages(user_id, COALESCE(utc_timestamp, timestamp))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp_validation ON messages(timestamp, temporal_validation_score)")
+        
+        # Time-based aggregation indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_hour_user ON messages(user_id, strftime('%H', COALESCE(local_timestamp, timestamp)))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_day_user ON messages(user_id, strftime('%Y-%m-%d', COALESCE(local_timestamp, timestamp)))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_week_user ON messages(user_id, strftime('%Y-%W', COALESCE(local_timestamp, timestamp)))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_month_user ON messages(user_id, strftime('%Y-%m', COALESCE(local_timestamp, timestamp)))")
+        
+        # Tag-temporal correlation indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_created_at ON entry_tags(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_tags_message_created ON entry_tags(message_id, created_at)")
+        
+        # Temporal signals indexes (from temporal_awareness.py tables)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_signals_user_time ON temporal_signals(user_id, created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_signals_type_time ON temporal_signals(signal_type, created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_signals_entry_user ON temporal_signals(entry_id, user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_states_updated ON temporal_states(updated_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_states_signal_time ON temporal_states(last_signal_time)")
+        
         # Add enhanced columns to messages table if they don't exist
         try:
             cursor.execute("ALTER TABLE messages ADD COLUMN intention_flag BOOLEAN DEFAULT FALSE")
@@ -1461,6 +1596,11 @@ def init_database():
             pass  # Column already exists
         try:
             cursor.execute("ALTER TABLE messages ADD COLUMN revision_count INTEGER DEFAULT 0")
+        except:
+            pass  # Column already exists
+        
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN temporal_signal_count INTEGER DEFAULT 0")
         except:
             pass  # Column already exists
         
@@ -2129,6 +2269,54 @@ async def suggest_tags(request: TagSuggestionRequest):
         logger.error(f"Tag suggestions failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get tag suggestions: {str(e)}")
 
+# ===== ASYNC BACKGROUND PROCESSING =====
+
+async def process_temporal_signals_async(user_id: str, message_id: str, content: str, timestamp: datetime):
+    """Process temporal signals asynchronously without blocking the main request"""
+    try:
+        logger.info(f"🔄 Starting async temporal signal processing for message {message_id}")
+        
+        # Detect temporal signals
+        signals = signal_detector.detect_signals(content, timestamp)
+        processed_signals = []
+        
+        for signal in signals:
+            try:
+                # Record temporal signal
+                state_manager.record_temporal_signal(user_id, signal, message_id)
+                processed_signals.append({
+                    "signal_type": signal.signal_type.value,
+                    "confidence": signal.confidence,
+                    "text_span": signal.text_span
+                })
+                logger.info(f"📅 Async detected temporal signal: {signal.signal_type.value} (confidence: {signal.confidence:.2f})")
+            except Exception as e:
+                logger.warning(f"Failed to record temporal signal: {e}")
+        
+        # Update entry with detected signals in background
+        if processed_signals:
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                # Update message with temporal signal count
+                cursor.execute("""
+                    UPDATE messages 
+                    SET temporal_signal_count = ?
+                    WHERE id = ?
+                """, (len(processed_signals), message_id))
+                
+                conn.commit()
+                cursor.close()
+                conn.close()
+                
+                logger.info(f"✅ Updated message {message_id} with {len(processed_signals)} temporal signals")
+            except Exception as e:
+                logger.warning(f"Failed to update message with temporal signals: {e}")
+        
+    except Exception as e:
+        logger.error(f"❌ Async temporal signal processing failed for message {message_id}: {e}")
+
 @app.post("/api/save")
 async def save_message(message: MessageRequest, client_timestamp: Optional[str] = None, 
                       client_timezone: Optional[str] = None):
@@ -2205,22 +2393,17 @@ async def save_message(message: MessageRequest, client_timestamp: Optional[str] 
             entry_timestamp = datetime.utcnow().isoformat()
             relationship_analyzer.update_relationship_tracking(message.user_id, message_id, relationships, entry_timestamp)
         
-        # Automatic temporal signal detection on entry storage
+        # Queue temporal signal detection for background processing (non-blocking)
         detected_signals = []
         try:
-            signals = signal_detector.detect_signals(message.content, timestamp_info.utc_timestamp)
-            for signal in signals:
-                # Record temporal signal
-                state_manager.record_temporal_signal(message.user_id, signal, message_id)
-                detected_signals.append({
-                    "signal_type": signal.signal_type.value,
-                    "confidence": signal.confidence,
-                    "detected_text": signal.detected_text
-                })
-                logger.info(f"📅 Auto-detected temporal signal: {signal.signal_type.value} (confidence: {signal.confidence:.2f})")
+            # Create async task for temporal signal detection - don't await it
+            temporal_task = asyncio.create_task(
+                process_temporal_signals_async(message.user_id, message_id, message.content, timestamp_info.utc_timestamp)
+            )
+            logger.info(f"📅 Temporal signal detection queued for background processing")
         except Exception as e:
-            logger.warning(f"Temporal signal detection failed: {e}")
-            # Don't fail the entry save if temporal detection fails
+            logger.warning(f"Failed to queue temporal signal detection: {e}")
+            # Don't fail the entry save if queueing fails
         
         logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags and {len(detected_signals)} temporal signals for user {message.user_id}")
         
@@ -2235,8 +2418,12 @@ async def save_message(message: MessageRequest, client_timestamp: Optional[str] 
             "validation_notes": timestamp_info.validation_notes,
             "applied_tags": applied_tags,
             "tag_count": len(applied_tags),
-            "temporal_signals": detected_signals,
-            "temporal_signal_count": len(detected_signals)
+            "temporal_signals": [],  # Processed asynchronously
+            "temporal_signal_count": 0,  # Updated in background
+            "async_processing": {
+                "temporal_signals": "processing_in_background",
+                "note": "Temporal signals are being processed asynchronously to improve response time"
+            }
         }
         
     except Exception as e:
@@ -2245,8 +2432,24 @@ async def save_message(message: MessageRequest, client_timestamp: Optional[str] 
 
 @app.get("/api/messages/{user_id}")
 async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Optional[str] = None,
-                      use_local_time: bool = True):
-    """Get messages for a user with optional tag filtering and timezone-aware timestamps"""
+                      use_local_time: bool = True, 
+                      # Temporal filtering parameters
+                      start_date: Optional[str] = None,
+                      end_date: Optional[str] = None,
+                      relative_period: Optional[str] = None,
+                      time_of_day_start: Optional[str] = None,
+                      time_of_day_end: Optional[str] = None,
+                      days_of_week: Optional[str] = None,
+                      timezone_override: Optional[str] = None):
+    """Get messages for a user with comprehensive temporal filtering and timezone-aware timestamps
+    
+    Temporal filtering options:
+    - start_date/end_date: ISO format date strings (e.g., '2024-01-01T00:00:00Z')
+    - relative_period: 'today', 'yesterday', 'last_7_days', 'last_30_days', 'this_week', 'last_week', 'this_month', 'last_month'
+    - time_of_day_start/end: Time range filtering (e.g., '08:00', '20:00')
+    - days_of_week: Comma-separated day numbers (0=Sunday, 1=Monday, etc.) e.g., '1,2,3,4,5' for weekdays
+    - timezone_override: Override user's timezone for filtering
+    """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -2255,10 +2458,57 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
         timestamp_field = "local_timestamp" if use_local_time else "utc_timestamp"
         fallback_field = "timestamp"  # Legacy fallback
         
+        # Build temporal filter if provided
+        temporal_filter = None
+        temporal_where = ""
+        temporal_params = []
+        
+        if any([start_date, end_date, relative_period, time_of_day_start, time_of_day_end, days_of_week]):
+            # Parse days_of_week if provided
+            days_list = None
+            if days_of_week:
+                try:
+                    days_list = [int(d.strip()) for d in days_of_week.split(",")]
+                except ValueError:
+                    logger.warning(f"Invalid days_of_week format: {days_of_week}")
+            
+            # Create temporal filter object
+            temporal_filter = TemporalFilterRequest(
+                start_date=start_date,
+                end_date=end_date,
+                relative_period=relative_period,
+                time_of_day_start=time_of_day_start,
+                time_of_day_end=time_of_day_end,
+                days_of_week=days_list,
+                timezone_override=timezone_override
+            )
+            
+            # Get user's timezone for filtering context
+            state_manager = TemporalStateManager(get_database_path())
+            user_timezone = state_manager.get_user_timezone(user_id)
+            
+            # Build temporal WHERE clause
+            temporal_where, temporal_params = TemporalQueryBuilder.build_temporal_where_clause(temporal_filter, user_timezone)
+        
+        # Base WHERE conditions
+        base_conditions = ["m.user_id = ?"]
+        base_params = [user_id]
+        
+        # Add temporal conditions if they exist
+        if temporal_where:
+            base_conditions.append(temporal_where)
+            base_params.extend(temporal_params)
+        
+        where_clause = " AND ".join(base_conditions)
+        
         if tags:
-            # Filter by tags
+            # Filter by tags with temporal filtering
             tag_list = [tag.strip() for tag in tags.split(",")]
             placeholders = ",".join("?" * len(tag_list))
+            
+            # Add tag filtering to conditions
+            tag_condition = f"t.name IN ({placeholders})"
+            all_params = base_params + tag_list + [limit, offset]
             
             cursor.execute(f"""
                 SELECT DISTINCT m.id, m.content, m.user_id, 
@@ -2268,22 +2518,24 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
                 FROM messages m
                 JOIN entry_tags et ON m.id = et.message_id
                 JOIN tags t ON et.tag_id = t.id
-                WHERE m.user_id = ? AND t.name IN ({placeholders})
+                WHERE {where_clause} AND {tag_condition}
                 ORDER BY COALESCE(m.{timestamp_field}, m.{fallback_field}) DESC
                 LIMIT ? OFFSET ?
-            """, [user_id] + tag_list + [limit, offset])
+            """, all_params)
         else:
-            # Get all messages
+            # Get all messages with temporal filtering
+            all_params = base_params + [limit, offset]
+            
             cursor.execute(f"""
                 SELECT id, content, user_id, 
                        COALESCE({timestamp_field}, {fallback_field}) as display_timestamp,
                        utc_timestamp, local_timestamp, timezone_at_creation,
                        temporal_validation_score, timestamp_source
-                FROM messages 
-                WHERE user_id = ? 
+                FROM messages m
+                WHERE {where_clause}
                 ORDER BY COALESCE({timestamp_field}, {fallback_field}) DESC 
                 LIMIT ? OFFSET ?
-            """, (user_id, limit, offset))
+            """, all_params)
         
         rows = cursor.fetchall()
         
@@ -2326,14 +2578,45 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
         cursor.close()
         conn.close()
         
-        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id} (using {'local' if use_local_time else 'UTC'} time)")
+        # Build filtering summary for response
+        filtering_applied = []
+        if tags:
+            filtering_applied.append(f"tags: {tags}")
+        if temporal_filter:
+            if temporal_filter.relative_period:
+                filtering_applied.append(f"period: {temporal_filter.relative_period}")
+            if temporal_filter.start_date or temporal_filter.end_date:
+                date_range = f"{temporal_filter.start_date or 'start'} to {temporal_filter.end_date or 'end'}"
+                filtering_applied.append(f"date_range: {date_range}")
+            if temporal_filter.time_of_day_start or temporal_filter.time_of_day_end:
+                time_range = f"{temporal_filter.time_of_day_start or '00:00'} to {temporal_filter.time_of_day_end or '23:59'}"
+                filtering_applied.append(f"time_range: {time_range}")
+            if temporal_filter.days_of_week:
+                filtering_applied.append(f"days_of_week: {temporal_filter.days_of_week}")
+        
+        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id} (using {'local' if use_local_time else 'UTC'} time) with filters: {', '.join(filtering_applied) if filtering_applied else 'none'}")
         
         return {
             "status": "success",
             "messages": messages,
             "count": len(messages),
             "filtered_by_tags": tags.split(",") if tags else None,
-            "timestamp_mode": "local" if use_local_time else "utc"
+            "timestamp_mode": "local" if use_local_time else "utc",
+            "temporal_filtering": {
+                "applied": bool(temporal_filter),
+                "filters": filtering_applied,
+                "relative_period": temporal_filter.relative_period if temporal_filter else None,
+                "date_range": {
+                    "start": temporal_filter.start_date if temporal_filter else None,
+                    "end": temporal_filter.end_date if temporal_filter else None
+                } if temporal_filter else None,
+                "time_of_day_range": {
+                    "start": temporal_filter.time_of_day_start if temporal_filter else None,
+                    "end": temporal_filter.time_of_day_end if temporal_filter else None
+                } if temporal_filter else None,
+                "days_of_week": temporal_filter.days_of_week if temporal_filter else None,
+                "timezone_used": temporal_filter.timezone_override if temporal_filter and temporal_filter.timezone_override else None
+            }
         }
         
     except Exception as e:
@@ -4037,6 +4320,111 @@ async def auto_detect_temporal_boundaries():
     except Exception as e:
         logger.error(f"Auto-detect temporal boundaries failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to auto-detect temporal boundaries: {str(e)}")
+
+# ========================================
+# TEMPORAL AGGREGATION API ENDPOINTS
+# ========================================
+
+@app.get("/api/temporal/activity-patterns/{user_id}")
+async def get_activity_patterns(user_id: str, days_back: int = 30, granularity: str = "hourly"):
+    """Get comprehensive activity patterns analysis"""
+    try:
+        summary_generator = TemporalSummaryGenerator(get_database_path())
+        patterns = summary_generator.get_activity_patterns(user_id, days_back)
+        return {"status": "success", "user_id": user_id, "activity_patterns": patterns}
+    except Exception as e:
+        logger.error(f"Activity patterns analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze activity patterns: {str(e)}")
+
+@app.get("/api/temporal/correlations/{user_id}")
+async def get_temporal_correlations(user_id: str, days_back: int = 30, correlation_type: str = "tags_time"):
+    """Analyze temporal correlations in user data"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        
+        if correlation_type == "tags_time":
+            cursor.execute('''
+                SELECT t.name, strftime('%H', COALESCE(m.local_timestamp, m.timestamp)) as hour,
+                       COUNT(*) as usage_count
+                FROM tags t
+                JOIN entry_tags et ON t.id = et.tag_id
+                JOIN messages m ON et.message_id = m.id
+                WHERE m.user_id = ? AND m.timestamp >= ?
+                GROUP BY t.name, hour HAVING usage_count >= 2
+                ORDER BY t.name, hour
+            ''', (user_id, cutoff_date.isoformat()))
+            
+            correlations = {}
+            for row in cursor.fetchall():
+                tag_name, hour, count = row
+                if tag_name not in correlations:
+                    correlations[tag_name] = {}
+                correlations[tag_name][hour] = count
+        else:
+            correlations = {"message": f"Correlation type {correlation_type} not implemented yet"}
+        
+        conn.close()
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "correlation_type": correlation_type,
+            "analysis_period_days": days_back,
+            "correlations": correlations
+        }
+    except Exception as e:
+        logger.error(f"Temporal correlations analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze temporal correlations: {str(e)}")
+
+@app.get("/api/temporal/insights/{user_id}")
+async def get_temporal_insights(user_id: str, insight_type: str = "comprehensive", days_back: int = 30):
+    """Generate advanced temporal insights and recommendations"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        
+        insights = []
+        recommendations = []
+        
+        # Find peak activity hours
+        cursor.execute('''
+            SELECT strftime('%H', COALESCE(local_timestamp, timestamp)) as hour,
+                   COUNT(*) as entry_count
+            FROM messages 
+            WHERE user_id = ? AND timestamp >= ?
+            GROUP BY hour
+            ORDER BY entry_count DESC
+            LIMIT 3
+        ''', (user_id, cutoff_date.isoformat()))
+        
+        peak_hours = cursor.fetchall()
+        if peak_hours:
+            best_hour = peak_hours[0][0]
+            insights.append({
+                "type": "productivity_peak",
+                "title": f"Peak activity at {best_hour}:00",
+                "description": f"You're most active around {best_hour}:00",
+                "confidence": 0.8
+            })
+            recommendations.append({
+                "type": "scheduling",
+                "title": "Optimize your schedule",
+                "description": f"Consider important tasks around {best_hour}:00"
+            })
+        
+        conn.close()
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "insights": insights,
+            "recommendations": recommendations,
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Temporal insights generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate temporal insights: {str(e)}")
 
 # ========================================
 # TIMESTAMP SYNCHRONIZATION API ENDPOINTS
