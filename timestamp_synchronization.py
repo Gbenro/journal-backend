@@ -13,7 +13,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import re
 # Delayed import to avoid circular dependency
-# from temporal_awareness import TemporalSignalDetector, SignalType
+from temporal_awareness import TemporalSignalDetector, SignalType
 
 logger = logging.getLogger(__name__)
 

@@ -69,7 +69,7 @@ class TemporalQueryBuilder:
         return start_date.astimezone(pytz.UTC), end_date.astimezone(pytz.UTC)
     
     @staticmethod
-    def build_temporal_where_clause(temporal_filter: TemporalFilterRequest, user_timezone: str = "UTC") -> tuple[str, list]:
+    def build_temporal_where_clause(temporal_filter: "TemporalFilterRequest", user_timezone: str = "UTC") -> tuple[str, list]:
         """Build WHERE clause and parameters for temporal filtering"""
         conditions = []
         params = []
