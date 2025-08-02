@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from schema_migration import check_database_schema, fix_database_schema
+from timestamp_synchronization import create_timestamp_tables
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,8 +23,13 @@ logger = logging.getLogger(__name__)
 def ensure_database_ready():
     """Ensure the database is ready before starting the server"""
     
-    # Determine database path
-    db_path = os.getenv('DATABASE_PATH', 'journal.db')
+    # Determine database path based on environment
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+        db_path = "/app/data/journal.db"
+        # Ensure data directory exists
+        os.makedirs("/app/data", exist_ok=True)
+    else:
+        db_path = os.getenv('DATABASE_PATH', 'journal.db')
     
     # Check if database exists
     if not os.path.exists(db_path):
@@ -38,6 +44,14 @@ def ensure_database_ready():
     if not schema_info.get("exists", False):
         logger.error(f"❌ Database check failed: {schema_info.get('error', 'Unknown error')}")
         return False
+    
+    # First ensure timestamp tables exist
+    try:
+        logger.info("🕐 Ensuring timestamp tables and columns exist...")
+        create_timestamp_tables(db_path)
+        logger.info("✅ Timestamp tables verified/created")
+    except Exception as e:
+        logger.warning(f"⚠️ Timestamp table creation warning: {e}")
     
     if not schema_info.get("needs_migration", False):
         logger.info("✅ Database schema is up to date")
@@ -65,7 +79,8 @@ def start_server():
     
     # Get server configuration from environment
     host = os.getenv('HOST', '0.0.0.0')
-    port = int(os.getenv('PORT', '8000'))
+    # Railway uses PORT environment variable
+    port = int(os.getenv('PORT', '8080'))
     
     # Start the server using uvicorn
     cmd = [
