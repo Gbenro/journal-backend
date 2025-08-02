@@ -1709,42 +1709,60 @@ def apply_tags_to_entry(conn: sqlite3.Connection, message_id: int, tags_data: Li
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup with comprehensive logging
-    Railway deployment test - 2025-07-21 - Verifying persistent volume mount"""
+    """Non-blocking startup for Railway health checks"""
     logger.info("🚀 Starting Mirror Scribe Backend with Intelligent Tags...")
     logger.info(f"📁 Environment: {'Railway' if is_railway_environment() else 'Local'}")
     logger.info(f"💾 Database path: {get_database_path()}")
     logger.info(f"📂 Data directory: {'/app/data' if is_railway_environment() else 'local'}")
     
-    # Initialize database
-    success = init_database()
-    
-    if success:
-        # Check existing data
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM messages")
-            message_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM tags")
-            tag_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM entry_tags")
-            tag_applications = cursor.fetchone()[0]
-            conn.close()
-            
-            logger.info(f"📝 Existing journal entries: {message_count}")
-            logger.info(f"🏷️ Available tags: {tag_count}")
-            logger.info(f"🔗 Tag applications: {tag_applications}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not check existing data: {e}")
+    # Schedule database initialization as a background task to avoid blocking health checks
+    import asyncio
+    asyncio.create_task(initialize_database_async())
+
+async def initialize_database_async():
+    """Async database initialization to avoid blocking startup"""
+    try:
+        # Initialize database
+        success = init_database()
         
-        logger.info("✅ Mirror Scribe Backend ready with persistent storage!")
-    else:
-        logger.warning("⚠️ Database initialization failed, but continuing...")
+        if success:
+            # Check existing data
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM messages")
+                message_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM tags")
+                tag_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM entry_tags")
+                tag_applications = cursor.fetchone()[0]
+                conn.close()
+                
+                logger.info(f"📝 Existing journal entries: {message_count}")
+                logger.info(f"🏷️ Available tags: {tag_count}")
+                logger.info(f"🔗 Tag applications: {tag_applications}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not check existing data: {e}")
+            
+            logger.info("✅ Mirror Scribe Backend ready with persistent storage!")
+        else:
+            logger.warning("⚠️ Database initialization failed, but continuing...")
+    except Exception as e:
+        logger.error(f"❌ Background database initialization failed: {e}")
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check with persistent storage info"""
+    """Simple health check for Railway deployment"""
+    return {
+        "status": "healthy",
+        "service": "backend",
+        "version": "2.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/health/detailed")
+async def detailed_health_check():
+    """Detailed health check with database connectivity"""
     try:
         db_path = get_database_path()
         conn = get_db_connection()
@@ -1788,7 +1806,7 @@ async def health_check():
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"Detailed health check failed: {e}")
         return {
             "status": "unhealthy",
             "database": "sqlite_disconnected", 
