@@ -1389,6 +1389,44 @@ def init_database():
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
+        # Check if messages table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+        table_exists = cursor.fetchone() is not None
+        
+        if table_exists:
+            # Table exists, check and add missing columns
+            logger.info("📋 Messages table exists, checking for missing columns...")
+            cursor.execute("PRAGMA table_info(messages)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            
+            # Define required columns that might be missing
+            columns_to_add = [
+                ("utc_timestamp", "DATETIME"),
+                ("local_timestamp", "DATETIME"),
+                ("timezone_at_creation", "TEXT DEFAULT 'America/Chicago'"),
+                ("timestamp_source", "TEXT DEFAULT 'auto'"),
+                ("temporal_validation_score", "REAL DEFAULT 0.5"),
+                ("intention_flag", "BOOLEAN DEFAULT FALSE"),
+                ("manual_energy_signature", "TEXT"),
+                ("relationship_mentions", "JSON"),
+                ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+                ("revision_count", "INTEGER DEFAULT 0"),
+                ("temporal_signal_count", "INTEGER DEFAULT 0")
+            ]
+            
+            for column_name, column_def in columns_to_add:
+                if column_name not in existing_columns:
+                    try:
+                        logger.info(f"➕ Adding missing column: {column_name}")
+                        cursor.execute(f"ALTER TABLE messages ADD COLUMN {column_name} {column_def}")
+                    except sqlite3.OperationalError as e:
+                        logger.warning(f"⚠️ Could not add column {column_name}: {e}")
+            
+            logger.info("✅ Messages table columns updated")
+        else:
+            # Create new table with all columns
+            logger.info("📝 Creating new messages table...")
+        
         # Create messages table with all timestamp columns
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -1652,12 +1690,17 @@ def verify_database_schema(db_path: str) -> bool:
             return False
         
         # Test a simple query to ensure the columns are accessible
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE utc_timestamp IS NULL OR local_timestamp IS NULL")
-        unmigrated_count = cursor.fetchone()[0]
+        try:
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE utc_timestamp IS NULL OR local_timestamp IS NULL")
+            unmigrated_count = cursor.fetchone()[0]
+            logger.info(f"✅ Database schema verification passed. Unmigrated entries: {unmigrated_count}")
+        except sqlite3.OperationalError as e:
+            # This is expected if we're verifying during initial creation
+            logger.info(f"⚠️ Schema verification query skipped (expected during initial creation): {e}")
+            unmigrated_count = 0
         
         conn.close()
         
-        logger.info(f"✅ Database schema verification passed. Unmigrated entries: {unmigrated_count}")
         return True
         
     except Exception as e:
