@@ -12,7 +12,8 @@ import logging
 from dataclasses import dataclass, asdict
 from enum import Enum
 import re
-from temporal_awareness import TemporalSignalDetector, SignalType
+# Delayed import to avoid circular dependency
+# from temporal_awareness import TemporalSignalDetector, SignalType
 
 logger = logging.getLogger(__name__)
 
