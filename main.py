@@ -331,8 +331,13 @@ class TimestampOverrideRequest(BaseModel):
     reason: Optional[str] = ""
 
 class TimezoneUpdateRequest(BaseModel):
-    user_id: str
     timezone_name: str
+
+class TimezoneSuggestionRequest(BaseModel):
+    context: Optional[str] = None
+    partial_name: Optional[str] = None
+    country_code: Optional[str] = None
+    user_location: Optional[str] = None
 
 class BulkTimestampCorrectionRequest(BaseModel):
     user_id: str
@@ -4636,18 +4641,15 @@ async def get_temporal_state(user_id: str):
         return {
             "status": "success",
             "user_id": temporal_state.user_id,
-            "timezone": temporal_state.timezone,
-            "boundaries": {
-                "last_day_start": temporal_state.last_day_start.isoformat() if temporal_state.last_day_start else None,
-                "last_day_end": temporal_state.last_day_end.isoformat() if temporal_state.last_day_end else None,
-                "last_week_start": temporal_state.last_week_start.isoformat() if temporal_state.last_week_start else None,
-                "last_week_end": temporal_state.last_week_end.isoformat() if temporal_state.last_week_end else None,
-                "last_month_start": temporal_state.last_month_start.isoformat() if temporal_state.last_month_start else None,
-                "last_month_end": temporal_state.last_month_end.isoformat() if temporal_state.last_month_end else None,
-                "last_year_start": temporal_state.last_year_start.isoformat() if temporal_state.last_year_start else None,
-                "last_year_end": temporal_state.last_year_end.isoformat() if temporal_state.last_year_end else None,
+            "timezone": temporal_state.current_timezone,  # Middleware expects "timezone" not "current_timezone"
+            "current_timezone": temporal_state.current_timezone,  # Keep for backward compatibility
+            "last_signal": {
+                "signal_type": temporal_state.last_signal.signal_type.value if temporal_state.last_signal else None,
+                "confidence": temporal_state.last_signal.confidence if temporal_state.last_signal else None,
+                "text_span": temporal_state.last_signal.text_span if temporal_state.last_signal else None,
+                "metadata": temporal_state.last_signal.metadata if temporal_state.last_signal else None
             },
-            "updated_at": temporal_state.updated_at.isoformat() if temporal_state.updated_at else None
+            "last_updated": temporal_state.last_updated.isoformat() if temporal_state.last_updated else None
         }
         
     except Exception as e:
@@ -5086,6 +5088,26 @@ async def validate_timestamp(request: TimestampValidationRequest):
         logger.error(f"Timestamp validation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to validate timestamp: {str(e)}")
 
+@app.get("/api/user/{user_id}/timezone")
+async def get_user_timezone(user_id: str):
+    """Get user's current timezone preference"""
+    try:
+        logger.info(f"🌍 Getting timezone for user {user_id}")
+        
+        # Get user's timezone
+        user_timezone = timezone_manager.get_user_timezone(DATABASE_FILE, user_id)
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "timezone": user_timezone,
+            "is_valid": timezone_manager.validate_timezone(user_timezone)
+        }
+        
+    except Exception as e:
+        logger.error(f"Get user timezone failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get user timezone: {str(e)}")
+
 @app.put("/api/user/{user_id}/timezone")
 async def update_user_timezone(user_id: str, request: TimezoneUpdateRequest):
     """Update user's timezone preference"""
@@ -5171,6 +5193,74 @@ async def get_timezone_suggestions(partial_name: Optional[str] = None, country_c
     except Exception as e:
         logger.error(f"Timezone suggestions failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get timezone suggestions: {str(e)}")
+
+@app.post("/api/timezone/suggestions")
+async def post_timezone_suggestions(request: TimezoneSuggestionRequest):
+    """Get timezone suggestions based on context with intelligent analysis"""
+    try:
+        logger.info(f"🌍 Getting contextual timezone suggestions: context='{request.context}', partial='{request.partial_name}', location='{request.user_location}'")
+        
+        # Start with basic suggestions based on partial name or country
+        base_suggestions = timezone_manager.get_timezone_suggestions(request.partial_name, request.country_code)
+        
+        # Enhanced suggestions based on context analysis
+        contextual_suggestions = []
+        
+        if request.context:
+            # Analyze context for timezone hints
+            context_lower = request.context.lower()
+            
+            # Look for city/location mentions
+            city_timezone_map = {
+                "new york": "America/New_York",
+                "chicago": "America/Chicago", 
+                "los angeles": "America/Los_Angeles",
+                "london": "Europe/London",
+                "paris": "Europe/Paris",
+                "tokyo": "Asia/Tokyo",
+                "sydney": "Australia/Sydney",
+                "toronto": "America/Toronto",
+                "vancouver": "America/Vancouver",
+                "berlin": "Europe/Berlin",
+                "shanghai": "Asia/Shanghai"
+            }
+            
+            for city, timezone in city_timezone_map.items():
+                if city in context_lower and timezone not in base_suggestions:
+                    contextual_suggestions.append(timezone)
+            
+            # Look for time-related context clues
+            if "morning" in context_lower or "breakfast" in context_lower:
+                # Suggest timezones where it could be morning
+                pass  # This would require more complex logic based on current time
+                
+        # Combine and deduplicate suggestions
+        all_suggestions = base_suggestions + contextual_suggestions
+        unique_suggestions = list(dict.fromkeys(all_suggestions))  # Preserves order while removing duplicates
+        
+        # Limit to reasonable number
+        final_suggestions = unique_suggestions[:15]
+        
+        return {
+            "status": "success",
+            "suggestions": final_suggestions,
+            "analysis": {
+                "context_provided": bool(request.context),
+                "base_matches": len(base_suggestions),
+                "contextual_matches": len(contextual_suggestions),
+                "total_suggestions": len(final_suggestions)
+            },
+            "query": {
+                "context": request.context,
+                "partial_name": request.partial_name,
+                "country_code": request.country_code,
+                "user_location": request.user_location
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Contextual timezone suggestions failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get contextual timezone suggestions: {str(e)}")
 
 @app.get("/api/timestamp/validation-report/{user_id}")
 async def get_validation_report(user_id: str, days_back: int = 7, min_score: float = 0.5):

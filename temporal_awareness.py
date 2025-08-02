@@ -3,7 +3,7 @@ Minimal Temporal Awareness Module for Testing
 Provides basic temporal signal detection for timestamp validation.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from dataclasses import dataclass
 from typing import List
