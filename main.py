@@ -1748,12 +1748,19 @@ async def startup_event():
     asyncio.create_task(initialize_database_async())
 
 async def initialize_database_async():
-    """Async database initialization to avoid blocking startup"""
+    """Async database initialization to avoid blocking startup - ENHANCED WITH AUTO-MIGRATION"""
     try:
         # Initialize database
         success = init_database()
         
         if success:
+            # Auto-check and migrate missing columns
+            try:
+                logger.info("🔍 Checking database schema and auto-migrating if needed...")
+                await auto_migrate_missing_columns()
+            except Exception as e:
+                logger.warning(f"⚠️ Auto-migration check failed: {e}")
+            
             # Check existing data
             try:
                 conn = get_db_connection()
@@ -1764,19 +1771,91 @@ async def initialize_database_async():
                 tag_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM entry_tags")
                 tag_applications = cursor.fetchone()[0]
+                
+                # Check schema completeness
+                cursor.execute("PRAGMA table_info(messages)")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+                required_columns = {'utc_timestamp', 'local_timestamp', 'timezone_at_creation', 'timestamp_source', 'temporal_validation_score'}
+                missing_columns = required_columns - existing_columns
+                
                 conn.close()
                 
+                schema_status = "COMPLETE" if not missing_columns else f"MISSING: {', '.join(missing_columns)}"
                 logger.info(f"📝 Existing journal entries: {message_count}")
                 logger.info(f"🏷️ Available tags: {tag_count}")
                 logger.info(f"🔗 Tag applications: {tag_applications}")
+                logger.info(f"🏗️ Schema status: {schema_status}")
+                
             except Exception as e:
                 logger.warning(f"⚠️ Could not check existing data: {e}")
             
-            logger.info("✅ Mirror Scribe Backend ready with persistent storage!")
+            logger.info("✅ Mirror Scribe Backend ready with persistent storage and resilient schema!")
         else:
             logger.warning("⚠️ Database initialization failed, but continuing...")
     except Exception as e:
         logger.error(f"❌ Background database initialization failed: {e}")
+
+async def auto_migrate_missing_columns():
+    """Automatically check and migrate missing columns during startup"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check for missing columns
+        required_columns = [
+            {"name": "utc_timestamp", "definition": "DATETIME", "description": "UTC timestamp"},
+            {"name": "local_timestamp", "definition": "DATETIME", "description": "Local timestamp"},
+            {"name": "timezone_at_creation", "definition": "VARCHAR(50)", "description": "Timezone when created"},
+            {"name": "timestamp_source", "definition": "VARCHAR(20) DEFAULT 'auto'", "description": "Source of timestamp"},
+            {"name": "temporal_validation_score", "definition": "FLOAT DEFAULT 1.0", "description": "Temporal validation score"},
+            {"name": "relationship_mentions", "definition": "TEXT", "description": "JSON array of relationship mentions"}
+        ]
+        
+        columns_added = 0
+        for column_info in required_columns:
+            column_name = column_info["name"]
+            column_def = column_info["definition"]
+            
+            if not check_column_exists(cursor, "messages", column_name):
+                try:
+                    logger.info(f"➕ Auto-adding missing column '{column_name}'")
+                    alter_sql = f"ALTER TABLE messages ADD COLUMN {column_name} {column_def}"
+                    cursor.execute(alter_sql)
+                    columns_added += 1
+                except Exception as e:
+                    logger.warning(f"Failed to auto-add column '{column_name}': {e}")
+        
+        # Migrate existing data if new columns were added
+        if columns_added > 0:
+            logger.info(f"🔄 Auto-migrating existing data for {columns_added} new columns...")
+            try:
+                cursor.execute("""
+                    UPDATE messages 
+                    SET utc_timestamp = COALESCE(utc_timestamp, timestamp),
+                        local_timestamp = COALESCE(local_timestamp, timestamp),
+                        timezone_at_creation = COALESCE(timezone_at_creation, 'UTC'),
+                        timestamp_source = COALESCE(timestamp_source, 'auto'),
+                        temporal_validation_score = COALESCE(temporal_validation_score, 0.5),
+                        relationship_mentions = COALESCE(relationship_mentions, '[]')
+                    WHERE utc_timestamp IS NULL OR local_timestamp IS NULL
+                """)
+                migrated_count = cursor.rowcount
+                logger.info(f"✅ Auto-migrated {migrated_count} existing messages")
+            except Exception as e:
+                logger.warning(f"Auto-migration of existing data failed: {e}")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        if columns_added > 0:
+            logger.info(f"🎉 Auto-migration completed: {columns_added} columns added")
+        else:
+            logger.info("✅ Database schema is complete, no migration needed")
+            
+    except Exception as e:
+        logger.error(f"Auto-migration failed: {e}")
+        # Don't raise - let the app continue even if auto-migration fails
 
 @app.get("/health")
 async def health_check():
@@ -2199,6 +2278,284 @@ async def migrate_enhancement_system():
         logger.error(f"Enhancement System migration failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to migrate enhancement system: {str(e)}")
 
+@app.get("/api/schema-status")
+async def get_schema_status():
+    """Get current database schema status and compatibility information"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check messages table schema
+        cursor.execute("PRAGMA table_info(messages)")
+        existing_columns = {row[1]: row[2] for row in cursor.fetchall()}
+        
+        # Required columns for full functionality
+        required_columns = {
+            'id': 'INTEGER',
+            'content': 'TEXT',
+            'user_id': 'TEXT',
+            'timestamp': 'DATETIME',
+            'utc_timestamp': 'DATETIME',
+            'local_timestamp': 'DATETIME',
+            'timezone_at_creation': 'VARCHAR(50)',
+            'timestamp_source': 'VARCHAR(20)',
+            'temporal_validation_score': 'FLOAT',
+            'relationship_mentions': 'TEXT'
+        }
+        
+        # Analyze schema
+        present_columns = []
+        missing_columns = []
+        
+        for col_name, col_type in required_columns.items():
+            if col_name in existing_columns:
+                present_columns.append({
+                    "name": col_name,
+                    "type": existing_columns[col_name],
+                    "required_type": col_type
+                })
+            else:
+                missing_columns.append({
+                    "name": col_name,
+                    "type": col_type,
+                    "status": "missing"
+                })
+        
+        # Get table stats
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        total_messages = cursor.fetchone()[0]
+        
+        # Check data migration status
+        migration_stats = {}
+        if 'utc_timestamp' in existing_columns:
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE utc_timestamp IS NULL")
+            migration_stats["unmigrated_utc"] = cursor.fetchone()[0]
+        
+        if 'local_timestamp' in existing_columns:
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE local_timestamp IS NULL")
+            migration_stats["unmigrated_local"] = cursor.fetchone()[0]
+        
+        cursor.close()
+        conn.close()
+        
+        # Determine compatibility level
+        compatibility_level = "FULL" if not missing_columns else "PARTIAL" if len(missing_columns) <= 3 else "BASIC"
+        
+        return {
+            "status": "success",
+            "database_path": get_database_path(),
+            "timestamp": datetime.utcnow().isoformat(),
+            "compatibility_level": compatibility_level,
+            "schema_analysis": {
+                "total_columns": len(existing_columns),
+                "required_columns": len(required_columns),
+                "present_columns": len(present_columns),
+                "missing_columns": len(missing_columns)
+            },
+            "columns": {
+                "present": present_columns,
+                "missing": missing_columns
+            },
+            "data_stats": {
+                "total_messages": total_messages,
+                "migration_status": migration_stats
+            },
+            "recommendations": {
+                "action_needed": len(missing_columns) > 0,
+                "recommended_endpoint": "/api/emergency-migrate" if missing_columns else None,
+                "api_compatibility": {
+                    "save_message": "RESILIENT" if compatibility_level in ["FULL", "PARTIAL"] else "BASIC",
+                    "get_messages": "RESILIENT" if compatibility_level in ["FULL", "PARTIAL"] else "BASIC"
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Schema status check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to check schema status: {str(e)}")
+
+def check_column_exists(cursor, table_name: str, column_name: str) -> bool:
+    """Check if a column exists in a table"""
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [row[1] for row in cursor.fetchall()]
+        return column_name in columns
+    except Exception as e:
+        logger.error(f"Error checking column {column_name} in {table_name}: {e}")
+        return False
+
+def get_missing_columns(cursor, table_name: str, required_columns: list) -> list:
+    """Get list of missing columns from a table"""
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        missing = [col for col in required_columns if col not in existing_columns]
+        return missing
+    except Exception as e:
+        logger.error(f"Error checking missing columns in {table_name}: {e}")
+        return required_columns
+
+@app.post("/api/emergency-migrate")
+async def emergency_migrate_database():
+    """
+    Emergency database migration endpoint for fixing missing columns on live deployment
+    This endpoint can be called via HTTP to fix schema issues without redeploy
+    """
+    try:
+        logger.info("🚨 Starting EMERGENCY database migration...")
+        
+        migration_results = {
+            "success": False,
+            "database_path": get_database_path(),
+            "timestamp": datetime.utcnow().isoformat(),
+            "columns_added": [],
+            "columns_skipped": [],
+            "data_migrated": 0,
+            "errors": [],
+            "pre_migration_stats": {},
+            "post_migration_stats": {}
+        }
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get pre-migration stats
+        try:
+            cursor.execute("SELECT COUNT(*) FROM messages")
+            total_messages = cursor.fetchone()[0]
+            migration_results["pre_migration_stats"]["total_messages"] = total_messages
+            
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE local_timestamp IS NULL")
+            unmigrated_messages = cursor.fetchone()[0]
+            migration_results["pre_migration_stats"]["unmigrated_messages"] = unmigrated_messages
+        except Exception as e:
+            logger.warning(f"Could not get pre-migration stats: {e}")
+        
+        # Define required columns for messages table
+        required_columns = [
+            {"name": "utc_timestamp", "definition": "DATETIME", "description": "UTC timestamp"},
+            {"name": "local_timestamp", "definition": "DATETIME", "description": "Local timestamp"},
+            {"name": "timezone_at_creation", "definition": "VARCHAR(50)", "description": "Timezone when created"},
+            {"name": "timestamp_source", "definition": "VARCHAR(20) DEFAULT 'auto'", "description": "Source of timestamp"},
+            {"name": "temporal_validation_score", "definition": "FLOAT DEFAULT 1.0", "description": "Temporal validation score"},
+            {"name": "relationship_mentions", "definition": "TEXT", "description": "JSON array of relationship mentions"}
+        ]
+        
+        # Check for missing columns and add them
+        logger.info("🔍 Checking for missing columns in messages table...")
+        
+        for column_info in required_columns:
+            column_name = column_info["name"]
+            column_def = column_info["definition"]
+            description = column_info["description"]
+            
+            if check_column_exists(cursor, "messages", column_name):
+                logger.info(f"✅ Column '{column_name}' already exists")
+                migration_results["columns_skipped"].append({
+                    "column": column_name,
+                    "reason": "already_exists"
+                })
+            else:
+                try:
+                    logger.info(f"➕ Adding missing column '{column_name}': {description}")
+                    alter_sql = f"ALTER TABLE messages ADD COLUMN {column_name} {column_def}"
+                    cursor.execute(alter_sql)
+                    
+                    migration_results["columns_added"].append({
+                        "column": column_name,
+                        "definition": column_def,
+                        "description": description
+                    })
+                    logger.info(f"✅ Successfully added column '{column_name}'")
+                    
+                except Exception as e:
+                    error_msg = f"Failed to add column '{column_name}': {str(e)}"
+                    logger.error(error_msg)
+                    migration_results["errors"].append(error_msg)
+        
+        # Migrate existing data for new timestamp columns
+        if any(col["column"] in ["utc_timestamp", "local_timestamp", "timezone_at_creation"] 
+               for col in migration_results["columns_added"]):
+            
+            logger.info("🔄 Migrating existing message timestamps...")
+            try:
+                # Update messages with missing timestamp data
+                cursor.execute("""
+                    UPDATE messages 
+                    SET utc_timestamp = timestamp,
+                        local_timestamp = timestamp,
+                        timezone_at_creation = 'UTC',
+                        timestamp_source = 'migrated',
+                        temporal_validation_score = 0.5
+                    WHERE utc_timestamp IS NULL OR local_timestamp IS NULL
+                """)
+                
+                migrated_count = cursor.rowcount
+                migration_results["data_migrated"] = migrated_count
+                logger.info(f"✅ Migrated {migrated_count} message timestamps")
+                
+            except Exception as e:
+                error_msg = f"Failed to migrate timestamp data: {str(e)}"
+                logger.error(error_msg)
+                migration_results["errors"].append(error_msg)
+        
+        # Initialize relationship_mentions for existing messages
+        if any(col["column"] == "relationship_mentions" for col in migration_results["columns_added"]):
+            logger.info("🔄 Initializing relationship mentions...")
+            try:
+                cursor.execute("""
+                    UPDATE messages 
+                    SET relationship_mentions = '[]'
+                    WHERE relationship_mentions IS NULL
+                """)
+                logger.info("✅ Initialized relationship mentions")
+            except Exception as e:
+                error_msg = f"Failed to initialize relationship mentions: {str(e)}"
+                logger.error(error_msg)
+                migration_results["errors"].append(error_msg)
+        
+        # Commit all changes
+        conn.commit()
+        
+        # Get post-migration stats
+        try:
+            cursor.execute("SELECT COUNT(*) FROM messages")
+            total_messages = cursor.fetchone()[0]
+            migration_results["post_migration_stats"]["total_messages"] = total_messages
+            
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE local_timestamp IS NULL")
+            unmigrated_messages = cursor.fetchone()[0]
+            migration_results["post_migration_stats"]["unmigrated_messages"] = unmigrated_messages
+            
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE temporal_validation_score IS NOT NULL")
+            validated_messages = cursor.fetchone()[0]
+            migration_results["post_migration_stats"]["validated_messages"] = validated_messages
+            
+        except Exception as e:
+            logger.warning(f"Could not get post-migration stats: {e}")
+        
+        cursor.close()
+        conn.close()
+        
+        # Determine success
+        migration_results["success"] = len(migration_results["errors"]) == 0
+        
+        if migration_results["success"]:
+            logger.info("🎉 Emergency database migration completed successfully!")
+        else:
+            logger.warning(f"⚠️  Emergency migration completed with {len(migration_results['errors'])} errors")
+        
+        return migration_results
+        
+    except Exception as e:
+        logger.error(f"❌ Emergency migration failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat(),
+            "database_path": get_database_path()
+        }
+
 # Tag management endpoints
 @app.get("/api/tags")
 async def get_all_tags():
@@ -2366,37 +2723,88 @@ async def process_temporal_signals_async(user_id: str, message_id: str, content:
 @app.post("/api/save")
 async def save_message(message: MessageRequest, client_timestamp: Optional[str] = None, 
                       client_timezone: Optional[str] = None):
-    """Save a journal entry with enhanced tag support and timestamp synchronization"""
+    """Save a journal entry with enhanced tag support and timestamp synchronization - RESILIENT VERSION"""
     try:
-        # Create comprehensive timestamp information
-        timestamp_info = timestamp_synchronizer.create_timestamp_info(
-            content=message.content,
-            user_id=message.user_id,
-            client_timestamp=client_timestamp,
-            client_timezone=client_timezone,
-            timestamp_source=TimestampSource.CLIENT_PROVIDED if client_timestamp else TimestampSource.AUTO
-        )
-        
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Insert message with dual timestamp system
-        cursor.execute("""
-            INSERT INTO messages (
-                content, user_id, timestamp, 
-                utc_timestamp, local_timestamp, timezone_at_creation,
-                timestamp_source, temporal_validation_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            message.content, 
-            message.user_id, 
-            timestamp_info.utc_timestamp.isoformat(),  # Legacy timestamp field
-            timestamp_info.utc_timestamp.isoformat(),
-            timestamp_info.local_timestamp.isoformat(),
-            timestamp_info.timezone_name,
-            timestamp_info.timestamp_source.value,
-            timestamp_info.validation_score
-        ))
+        # Check which columns exist in the messages table
+        cursor.execute("PRAGMA table_info(messages)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        
+        # Core required columns (must exist)
+        core_columns = ['content', 'user_id', 'timestamp']
+        missing_core = [col for col in core_columns if col not in existing_columns]
+        if missing_core:
+            raise HTTPException(status_code=500, detail=f"Critical database columns missing: {missing_core}")
+        
+        # Enhanced columns (optional)
+        enhanced_columns = {
+            'utc_timestamp': 'DATETIME',
+            'local_timestamp': 'DATETIME', 
+            'timezone_at_creation': 'VARCHAR(50)',
+            'timestamp_source': 'VARCHAR(20)',
+            'temporal_validation_score': 'FLOAT',
+            'relationship_mentions': 'TEXT'
+        }
+        
+        # Create timestamp information (fallback to basic if timestamp synchronizer fails)
+        timestamp_info = None
+        current_time = datetime.utcnow()
+        
+        try:
+            timestamp_info = timestamp_synchronizer.create_timestamp_info(
+                content=message.content,
+                user_id=message.user_id,
+                client_timestamp=client_timestamp,
+                client_timezone=client_timezone,
+                timestamp_source=TimestampSource.CLIENT_PROVIDED if client_timestamp else TimestampSource.AUTO
+            )
+        except Exception as e:
+            logger.warning(f"Timestamp synchronizer failed, using fallback: {e}")
+            # Create basic timestamp info
+            timestamp_info = type('obj', (object,), {
+                'utc_timestamp': current_time,
+                'local_timestamp': current_time,
+                'timezone_name': client_timezone or 'UTC',
+                'timestamp_source': type('obj', (object,), {'value': 'fallback'})(),
+                'validation_score': 0.5,
+                'validation_notes': ['fallback_mode']
+            })()
+        
+        # Build INSERT statement dynamically based on available columns
+        insert_columns = ['content', 'user_id', 'timestamp']
+        insert_values = [message.content, message.user_id, timestamp_info.utc_timestamp.isoformat()]
+        
+        # Add enhanced columns if they exist
+        if 'utc_timestamp' in existing_columns:
+            insert_columns.append('utc_timestamp')
+            insert_values.append(timestamp_info.utc_timestamp.isoformat())
+            
+        if 'local_timestamp' in existing_columns:
+            insert_columns.append('local_timestamp')
+            insert_values.append(timestamp_info.local_timestamp.isoformat())
+            
+        if 'timezone_at_creation' in existing_columns:
+            insert_columns.append('timezone_at_creation')
+            insert_values.append(timestamp_info.timezone_name)
+            
+        if 'timestamp_source' in existing_columns:
+            insert_columns.append('timestamp_source')
+            insert_values.append(timestamp_info.timestamp_source.value)
+            
+        if 'temporal_validation_score' in existing_columns:
+            insert_columns.append('temporal_validation_score')
+            insert_values.append(timestamp_info.validation_score)
+        
+        # Execute insert with dynamic columns
+        placeholders = ', '.join(['?'] * len(insert_values))
+        column_list = ', '.join(insert_columns)
+        
+        cursor.execute(f"""
+            INSERT INTO messages ({column_list})
+            VALUES ({placeholders})
+        """, insert_values)
         
         message_id = cursor.lastrowid
         
@@ -2411,67 +2819,94 @@ async def save_message(message: MessageRequest, client_timestamp: Optional[str] 
                 "source": "manual"
             })
         
-        # Add auto tags if enabled
-        if message.auto_tag:
-            tagger = AutoTagger()
-            auto_tags = tagger.apply_auto_tags(message.content, message.manual_tags)
-            applied_tags.extend(auto_tags)
+        # Add auto tags if enabled (with error handling)
+        try:
+            if message.auto_tag:
+                tagger = AutoTagger()
+                auto_tags = tagger.apply_auto_tags(message.content, message.manual_tags)
+                applied_tags.extend(auto_tags)
+        except Exception as e:
+            logger.warning(f"Auto-tagging failed, continuing without auto tags: {e}")
         
-        # Apply all tags to the entry
-        apply_tags_to_entry(conn, message_id, applied_tags)
+        # Apply all tags to the entry (with error handling)
+        try:
+            apply_tags_to_entry(conn, message_id, applied_tags)
+        except Exception as e:
+            logger.warning(f"Tag application failed: {e}")
+            applied_tags = []  # Reset to empty if tagging fails
         
-        # Extract and track relationships
-        relationship_analyzer = RelationshipAnalyzer()
-        relationships = relationship_analyzer.extract_relationships(message.content)
-        relationship_names = [rel.get("name") for rel in relationships if rel.get("name")]
+        # Extract and track relationships (with graceful fallback)
+        relationships = []
+        relationship_names = []
         
-        # Update relationship mentions in message
-        cursor.execute("""
-            UPDATE messages SET relationship_mentions = ? WHERE id = ?
-        """, (json.dumps(relationship_names), message_id))
+        try:
+            relationship_analyzer = RelationshipAnalyzer()
+            relationships = relationship_analyzer.extract_relationships(message.content)
+            relationship_names = [rel.get("name") for rel in relationships if rel.get("name")]
+            
+            # Update relationship mentions if column exists
+            if 'relationship_mentions' in existing_columns:
+                cursor.execute("""
+                    UPDATE messages SET relationship_mentions = ? WHERE id = ?
+                """, (json.dumps(relationship_names), message_id))
+        except Exception as e:
+            logger.warning(f"Relationship extraction failed: {e}")
         
         conn.commit()
         cursor.close()
         conn.close()
         
-        # Update relationship tracking (done after commit to avoid long transactions)
-        if relationships:
-            entry_timestamp = datetime.utcnow().isoformat()
-            relationship_analyzer.update_relationship_tracking(message.user_id, message_id, relationships, entry_timestamp)
+        # Update relationship tracking (done after commit, with error handling)
+        try:
+            if relationships:
+                entry_timestamp = datetime.utcnow().isoformat()
+                relationship_analyzer.update_relationship_tracking(message.user_id, message_id, relationships, entry_timestamp)
+        except Exception as e:
+            logger.warning(f"Relationship tracking update failed: {e}")
         
         # Queue temporal signal detection for background processing (non-blocking)
-        detected_signals = []
         try:
-            # Create async task for temporal signal detection - don't await it
             temporal_task = asyncio.create_task(
                 process_temporal_signals_async(message.user_id, message_id, message.content, timestamp_info.utc_timestamp)
             )
             logger.info(f"📅 Temporal signal detection queued for background processing")
         except Exception as e:
             logger.warning(f"Failed to queue temporal signal detection: {e}")
-            # Don't fail the entry save if queueing fails
         
-        logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags and {len(detected_signals)} temporal signals for user {message.user_id}")
+        logger.info(f"💾 Saved message {message_id} with {len(applied_tags)} tags for user {message.user_id}")
         
-        return {
+        # Build response based on available data
+        response = {
             "status": "success",
             "message_id": message_id,
             "timestamp": timestamp_info.utc_timestamp.isoformat(),
-            "local_timestamp": timestamp_info.local_timestamp.isoformat(),
-            "timezone": timestamp_info.timezone_name,
-            "timestamp_source": timestamp_info.timestamp_source.value,
-            "temporal_validation_score": timestamp_info.validation_score,
-            "validation_notes": timestamp_info.validation_notes,
             "applied_tags": applied_tags,
             "tag_count": len(applied_tags),
-            "temporal_signals": [],  # Processed asynchronously
-            "temporal_signal_count": 0,  # Updated in background
-            "async_processing": {
-                "temporal_signals": "processing_in_background",
-                "note": "Temporal signals are being processed asynchronously to improve response time"
+            "schema_compatibility": {
+                "enhanced_columns_available": len([col for col in enhanced_columns if col in existing_columns]),
+                "total_enhanced_columns": len(enhanced_columns),
+                "missing_columns": [col for col in enhanced_columns if col not in existing_columns]
             }
         }
         
+        # Add enhanced timestamp info if available
+        if 'local_timestamp' in existing_columns:
+            response["local_timestamp"] = timestamp_info.local_timestamp.isoformat()
+        if 'timezone_at_creation' in existing_columns:
+            response["timezone"] = timestamp_info.timezone_name
+        if 'timestamp_source' in existing_columns:
+            response["timestamp_source"] = timestamp_info.timestamp_source.value
+        if 'temporal_validation_score' in existing_columns:
+            response["temporal_validation_score"] = timestamp_info.validation_score
+        
+        # Add validation notes if available
+        if hasattr(timestamp_info, 'validation_notes'):
+            response["validation_notes"] = timestamp_info.validation_notes
+        
+        return response
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
     except Exception as e:
         logger.error(f"Save message failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save message: {str(e)}")
@@ -2487,7 +2922,7 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
                       time_of_day_end: Optional[str] = None,
                       days_of_week: Optional[str] = None,
                       timezone_override: Optional[str] = None):
-    """Get messages for a user with comprehensive temporal filtering and timezone-aware timestamps
+    """Get messages for a user with comprehensive temporal filtering and timezone-aware timestamps - RESILIENT VERSION
     
     Temporal filtering options:
     - start_date/end_date: ISO format date strings (e.g., '2024-01-01T00:00:00Z')
@@ -2500,44 +2935,109 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Choose timestamp field based on preference
-        timestamp_field = "local_timestamp" if use_local_time else "utc_timestamp"
+        # Check which columns exist in the messages table
+        cursor.execute("PRAGMA table_info(messages)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        
+        # Determine available timestamp fields
+        has_local_timestamp = 'local_timestamp' in existing_columns
+        has_utc_timestamp = 'utc_timestamp' in existing_columns
+        has_enhanced_columns = has_local_timestamp and has_utc_timestamp
+        
+        # Choose timestamp field intelligently based on what's available
+        if use_local_time and has_local_timestamp:
+            timestamp_field = "local_timestamp"
+        elif has_utc_timestamp:
+            timestamp_field = "utc_timestamp"
+        else:
+            timestamp_field = "timestamp"  # Always available
+        
         fallback_field = "timestamp"  # Legacy fallback
         
-        # Build temporal filter if provided
+        # Build SELECT clause dynamically based on available columns
+        base_select_columns = ["id", "content", "user_id"]
+        
+        # Always include a display timestamp
+        if has_enhanced_columns:
+            base_select_columns.append(f"COALESCE({timestamp_field}, {fallback_field}) as display_timestamp")
+        else:
+            base_select_columns.append(f"{fallback_field} as display_timestamp")
+        
+        # Add enhanced columns if they exist
+        enhanced_select_columns = []
+        if 'utc_timestamp' in existing_columns:
+            enhanced_select_columns.append("utc_timestamp")
+        if 'local_timestamp' in existing_columns:
+            enhanced_select_columns.append("local_timestamp")
+        if 'timezone_at_creation' in existing_columns:
+            enhanced_select_columns.append("timezone_at_creation")
+        if 'temporal_validation_score' in existing_columns:
+            enhanced_select_columns.append("temporal_validation_score")
+        if 'timestamp_source' in existing_columns:
+            enhanced_select_columns.append("timestamp_source")
+        
+        all_select_columns = base_select_columns + enhanced_select_columns
+        select_clause = ", ".join(all_select_columns)
+        
+        # Build temporal filter if provided (with error handling)
         temporal_filter = None
         temporal_where = ""
         temporal_params = []
         
         if any([start_date, end_date, relative_period, time_of_day_start, time_of_day_end, days_of_week]):
-            # Parse days_of_week if provided
-            days_list = None
-            if days_of_week:
+            try:
+                # Parse days_of_week if provided
+                days_list = None
+                if days_of_week:
+                    try:
+                        days_list = [int(d.strip()) for d in days_of_week.split(",")]
+                    except ValueError:
+                        logger.warning(f"Invalid days_of_week format: {days_of_week}")
+                
+                # Create temporal filter object
+                temporal_filter = TemporalFilterRequest(
+                    start_date=start_date,
+                    end_date=end_date,
+                    relative_period=relative_period,
+                    time_of_day_start=time_of_day_start,
+                    time_of_day_end=time_of_day_end,
+                    days_of_week=days_list,
+                    timezone_override=timezone_override
+                )
+                
+                # Get user's timezone for filtering context (with fallback)
                 try:
-                    days_list = [int(d.strip()) for d in days_of_week.split(",")]
-                except ValueError:
-                    logger.warning(f"Invalid days_of_week format: {days_of_week}")
-            
-            # Create temporal filter object
-            temporal_filter = TemporalFilterRequest(
-                start_date=start_date,
-                end_date=end_date,
-                relative_period=relative_period,
-                time_of_day_start=time_of_day_start,
-                time_of_day_end=time_of_day_end,
-                days_of_week=days_list,
-                timezone_override=timezone_override
-            )
-            
-            # Get user's timezone for filtering context
-            state_manager = TemporalStateManager(get_database_path())
-            user_timezone = state_manager.get_user_timezone(user_id)
-            
-            # Build temporal WHERE clause
-            temporal_where, temporal_params = TemporalQueryBuilder.build_temporal_where_clause(temporal_filter, user_timezone)
+                    state_manager = TemporalStateManager(get_database_path())
+                    user_timezone = state_manager.get_user_timezone(user_id)
+                except Exception as e:
+                    logger.warning(f"Failed to get user timezone, using UTC: {e}")
+                    user_timezone = "UTC"
+                
+                # Build temporal WHERE clause (with fallback for missing columns)
+                try:
+                    temporal_where, temporal_params = TemporalQueryBuilder.build_temporal_where_clause(temporal_filter, user_timezone)
+                except Exception as e:
+                    logger.warning(f"Failed to build temporal WHERE clause: {e}")
+                    # Build basic date filtering as fallback
+                    if start_date or end_date:
+                        conditions = []
+                        if start_date:
+                            conditions.append(f"{fallback_field} >= ?")
+                            temporal_params.append(start_date)
+                        if end_date:
+                            conditions.append(f"{fallback_field} <= ?")
+                            temporal_params.append(end_date)
+                        temporal_where = " AND ".join(conditions)
+                        
+            except Exception as e:
+                logger.warning(f"Temporal filtering setup failed, proceeding without filtering: {e}")
+                temporal_filter = None
         
         # Base WHERE conditions
-        base_conditions = ["m.user_id = ?"]
+        if tags:
+            base_conditions = ["m.user_id = ?"]
+        else:
+            base_conditions = ["user_id = ?"]
         base_params = [user_id]
         
         # Add temporal conditions if they exist
@@ -2556,30 +3056,36 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
             tag_condition = f"t.name IN ({placeholders})"
             all_params = base_params + tag_list + [limit, offset]
             
+            # Build ORDER BY clause
+            if has_enhanced_columns:
+                order_by = f"COALESCE(m.{timestamp_field}, m.{fallback_field}) DESC"
+            else:
+                order_by = f"m.{fallback_field} DESC"
+            
             cursor.execute(f"""
-                SELECT DISTINCT m.id, m.content, m.user_id, 
-                       COALESCE(m.{timestamp_field}, m.{fallback_field}) as display_timestamp,
-                       m.utc_timestamp, m.local_timestamp, m.timezone_at_creation,
-                       m.temporal_validation_score, m.timestamp_source
+                SELECT DISTINCT m.{select_clause.replace('id,', 'id, m.').replace('content,', 'content, m.').replace('user_id,', 'user_id, m.')}
                 FROM messages m
                 JOIN entry_tags et ON m.id = et.message_id
                 JOIN tags t ON et.tag_id = t.id
                 WHERE {where_clause} AND {tag_condition}
-                ORDER BY COALESCE(m.{timestamp_field}, m.{fallback_field}) DESC
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
             """, all_params)
         else:
             # Get all messages with temporal filtering
             all_params = base_params + [limit, offset]
             
+            # Build ORDER BY clause
+            if has_enhanced_columns:
+                order_by = f"COALESCE({timestamp_field}, {fallback_field}) DESC"
+            else:
+                order_by = f"{fallback_field} DESC"
+            
             cursor.execute(f"""
-                SELECT id, content, user_id, 
-                       COALESCE({timestamp_field}, {fallback_field}) as display_timestamp,
-                       utc_timestamp, local_timestamp, timezone_at_creation,
-                       temporal_validation_score, timestamp_source
-                FROM messages m
+                SELECT {select_clause}
+                FROM messages
                 WHERE {where_clause}
-                ORDER BY COALESCE({timestamp_field}, {fallback_field}) DESC 
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
             """, all_params)
         
@@ -2588,37 +3094,47 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
         # Get tags for each message
         messages = []
         for row in rows:
-            # Convert row to dict, handling new timestamp fields
-            if len(row) >= 8:  # Enhanced format with timestamp sync data
-                message = {
-                    "id": row[0],
-                    "content": row[1],
-                    "user_id": row[2],
-                    "timestamp": row[3],  # Display timestamp
-                    "utc_timestamp": row[4],
-                    "local_timestamp": row[5],
-                    "timezone": row[6],
-                    "temporal_validation_score": row[7],
-                    "timestamp_source": row[8]
-                }
-            else:  # Legacy format
-                message = {
-                    "id": row[0],
-                    "content": row[1],
-                    "user_id": row[2],
-                    "timestamp": row[3]
-                }
+            # Build message dict dynamically based on available columns
+            message = {
+                "id": row[0],
+                "content": row[1],
+                "user_id": row[2],
+                "timestamp": row[3]  # Display timestamp
+            }
             
-            # Get tags for this message
-            cursor.execute("""
-                SELECT t.name, t.color, t.category, et.confidence, et.is_auto_tagged
-                FROM tags t
-                JOIN entry_tags et ON t.id = et.tag_id
-                WHERE et.message_id = ?
-            """, (message["id"],))
+            # Add enhanced columns if they exist
+            col_index = 4
+            if 'utc_timestamp' in existing_columns and col_index < len(row):
+                message["utc_timestamp"] = row[col_index]
+                col_index += 1
+            if 'local_timestamp' in existing_columns and col_index < len(row):
+                message["local_timestamp"] = row[col_index]
+                col_index += 1
+            if 'timezone_at_creation' in existing_columns and col_index < len(row):
+                message["timezone"] = row[col_index]
+                col_index += 1
+            if 'temporal_validation_score' in existing_columns and col_index < len(row):
+                message["temporal_validation_score"] = row[col_index]
+                col_index += 1
+            if 'timestamp_source' in existing_columns and col_index < len(row):
+                message["timestamp_source"] = row[col_index]
+                col_index += 1
             
-            tags_data = cursor.fetchall()
-            message["tags"] = [dict(tag) for tag in tags_data]
+            # Get tags for this message (with error handling)
+            try:
+                cursor.execute("""
+                    SELECT t.name, t.color, t.category, et.confidence, et.is_auto_tagged
+                    FROM tags t
+                    JOIN entry_tags et ON t.id = et.tag_id
+                    WHERE et.message_id = ?
+                """, (message["id"],))
+                
+                tags_data = cursor.fetchall()
+                message["tags"] = [dict(tag) for tag in tags_data]
+            except Exception as e:
+                logger.warning(f"Failed to get tags for message {message['id']}: {e}")
+                message["tags"] = []
+            
             messages.append(message)
         
         cursor.close()
@@ -2640,14 +3156,21 @@ async def get_messages(user_id: str, limit: int = 100, offset: int = 0, tags: Op
             if temporal_filter.days_of_week:
                 filtering_applied.append(f"days_of_week: {temporal_filter.days_of_week}")
         
-        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id} (using {'local' if use_local_time else 'UTC'} time) with filters: {', '.join(filtering_applied) if filtering_applied else 'none'}")
+        logger.info(f"📖 Retrieved {len(messages)} messages for user {user_id} (using {timestamp_field} time) with filters: {', '.join(filtering_applied) if filtering_applied else 'none'}")
         
         return {
             "status": "success",
             "messages": messages,
             "count": len(messages),
             "filtered_by_tags": tags.split(",") if tags else None,
-            "timestamp_mode": "local" if use_local_time else "utc",
+            "timestamp_mode": timestamp_field,
+            "schema_compatibility": {
+                "enhanced_columns_available": len(enhanced_select_columns),
+                "total_enhanced_columns": 5,  # utc_timestamp, local_timestamp, timezone_at_creation, temporal_validation_score, timestamp_source
+                "missing_columns": [col for col in ['utc_timestamp', 'local_timestamp', 'timezone_at_creation', 'temporal_validation_score', 'timestamp_source'] 
+                                  if col not in existing_columns],
+                "legacy_mode": not has_enhanced_columns
+            },
             "temporal_filtering": {
                 "applied": bool(temporal_filter),
                 "filters": filtering_applied,
