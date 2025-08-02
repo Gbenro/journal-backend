@@ -1384,13 +1384,24 @@ def init_database():
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # Create messages table
+        # Create messages table with all timestamp columns
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
                 user_id TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                utc_timestamp DATETIME,
+                local_timestamp DATETIME,
+                timezone_at_creation TEXT DEFAULT 'America/Chicago',
+                timestamp_source TEXT DEFAULT 'auto',
+                temporal_validation_score REAL DEFAULT 0.5,
+                intention_flag BOOLEAN DEFAULT FALSE,
+                manual_energy_signature TEXT,
+                relationship_mentions JSON,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                revision_count INTEGER DEFAULT 0,
+                temporal_signal_count INTEGER DEFAULT 0
             )
         """)
         
@@ -1577,32 +1588,7 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_states_updated ON temporal_states(updated_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_states_signal_time ON temporal_states(last_signal_time)")
         
-        # Add enhanced columns to messages table if they don't exist
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN intention_flag BOOLEAN DEFAULT FALSE")
-        except:
-            pass  # Column already exists
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN manual_energy_signature TEXT")
-        except:
-            pass  # Column already exists
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN relationship_mentions JSON")
-        except:
-            pass  # Column already exists
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        except:
-            pass  # Column already exists
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN revision_count INTEGER DEFAULT 0")
-        except:
-            pass  # Column already exists
-        
-        try:
-            cursor.execute("ALTER TABLE messages ADD COLUMN temporal_signal_count INTEGER DEFAULT 0")
-        except:
-            pass  # Column already exists
+        # Note: All enhanced columns are now included in the initial CREATE TABLE statement above
         
         # Insert predefined tags if they don't exist
         for tag_data in PREDEFINED_TAGS:
@@ -1624,11 +1610,53 @@ def init_database():
         # Create timestamp synchronization tables
         create_timestamp_tables(db_path)
         
+        # Verify the database schema is correct
+        if not verify_database_schema(db_path):
+            logger.error("❌ Database schema verification failed after initialization")
+            return False
+        
         logger.info(f"✅ Enhanced SQLite database with tags, temporal awareness, and timestamp synchronization initialized successfully at: {db_path}")
         return True
         
     except Exception as e:
         logger.error(f"❌ Database initialization failed at {db_path}: {e}")
+        return False
+
+def verify_database_schema(db_path: str) -> bool:
+    """Verify that the database has all required columns for the timestamp system"""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Check messages table schema
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in cursor.fetchall()}
+        
+        # Required columns for the application to function
+        required_columns = {
+            'id', 'content', 'user_id', 'timestamp',
+            'utc_timestamp', 'local_timestamp', 'timezone_at_creation',
+            'timestamp_source', 'temporal_validation_score'
+        }
+        
+        missing_columns = required_columns - columns
+        
+        if missing_columns:
+            logger.error(f"❌ Missing required columns in messages table: {missing_columns}")
+            conn.close()
+            return False
+        
+        # Test a simple query to ensure the columns are accessible
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE utc_timestamp IS NULL OR local_timestamp IS NULL")
+        unmigrated_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        logger.info(f"✅ Database schema verification passed. Unmigrated entries: {unmigrated_count}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Database schema verification failed: {e}")
         return False
 
 def create_indexes(cursor):

@@ -680,76 +680,94 @@ class TimestampSynchronizer:
             }
 
 def create_timestamp_tables(db_path: str) -> None:
-    """Create timestamp synchronization tables"""
-    conn = sqlite3.connect(db_path)
+    """Create timestamp synchronization tables and ensure all required columns exist"""
+    conn = sqlite3.connect(db_path, timeout=30.0)
     cursor = conn.cursor()
     
-    # Create users table if it doesn't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            timezone TEXT DEFAULT 'America/Chicago',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Create timestamp audit log table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS timestamp_audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_id INTEGER NOT NULL,
-            user_id TEXT NOT NULL,
-            old_utc_timestamp DATETIME,
-            old_local_timestamp DATETIME,
-            old_timezone TEXT,
-            new_utc_timestamp DATETIME,
-            new_local_timestamp DATETIME,
-            new_timezone TEXT,
-            reason TEXT,
-            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (entry_id) REFERENCES messages(id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Add columns to messages table if they don't exist
     try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN local_timestamp DATETIME")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN utc_timestamp DATETIME")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN timestamp_source TEXT DEFAULT 'auto'")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN timezone_at_creation TEXT DEFAULT 'America/Chicago'")
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN temporal_validation_score REAL DEFAULT 0.5")
-    except sqlite3.OperationalError:
-        pass
-    
-    # Create indexes
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_utc_timestamp ON messages(utc_timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_local_timestamp ON messages(local_timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_local_time ON messages(user_id, local_timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timezone ON messages(timezone_at_creation)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_audit_entry ON timestamp_audit_log(entry_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_audit_user ON timestamp_audit_log(user_id)")
-    
-    conn.commit()
-    conn.close()
-    
-    logger.info("✅ Timestamp synchronization tables created successfully")
+        # Create users table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                timezone TEXT DEFAULT 'America/Chicago',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create timestamp audit log table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS timestamp_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                old_utc_timestamp DATETIME,
+                old_local_timestamp DATETIME,
+                old_timezone TEXT,
+                new_utc_timestamp DATETIME,
+                new_local_timestamp DATETIME,
+                new_timezone TEXT,
+                reason TEXT,
+                changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (entry_id) REFERENCES messages(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Check which columns exist in messages table
+        cursor.execute("PRAGMA table_info(messages)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        
+        # Add missing timestamp columns to messages table for existing databases
+        required_columns = {
+            'local_timestamp': 'DATETIME',
+            'utc_timestamp': 'DATETIME', 
+            'timestamp_source': 'TEXT DEFAULT \'auto\'',
+            'timezone_at_creation': 'TEXT DEFAULT \'America/Chicago\'',
+            'temporal_validation_score': 'REAL DEFAULT 0.5'
+        }
+        
+        for column_name, column_def in required_columns.items():
+            if column_name not in existing_columns:
+                try:
+                    cursor.execute(f"ALTER TABLE messages ADD COLUMN {column_name} {column_def}")
+                    logger.info(f"✅ Added missing column: {column_name}")
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Could not add column {column_name}: {e}")
+        
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_utc_timestamp ON messages(utc_timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_local_timestamp ON messages(local_timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_local_time ON messages(user_id, local_timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timezone ON messages(timezone_at_creation)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_audit_entry ON timestamp_audit_log(entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp_audit_user ON timestamp_audit_log(user_id)")
+        
+        conn.commit()
+        
+        # After successful table creation, migrate existing data if needed
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE utc_timestamp IS NULL OR local_timestamp IS NULL")
+        unmigrated_count = cursor.fetchone()[0]
+        
+        if unmigrated_count > 0:
+            logger.info(f"🔄 Found {unmigrated_count} entries needing timestamp migration")
+            conn.close()
+            # Run migration
+            migration_result = migrate_existing_timestamps(db_path)
+            if migration_result['success']:
+                logger.info(f"✅ Migrated {migration_result['migrated_count']} timestamps successfully")
+            else:
+                logger.error(f"❌ Timestamp migration failed: {migration_result.get('error', 'Unknown error')}")
+        else:
+            conn.close()
+            logger.info("✅ All entries already have proper timestamps")
+            
+        logger.info("✅ Timestamp synchronization tables created successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to create timestamp tables: {e}")
+        conn.rollback()
+        conn.close()
+        raise
 
 def migrate_existing_timestamps(db_path: str, default_timezone: str = "America/Chicago") -> Dict[str, Any]:
     """Migrate existing timestamps to the new dual-timestamp system"""
