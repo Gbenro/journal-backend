@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from schema_migration import check_database_schema, fix_database_schema
 from timestamp_synchronization import create_timestamp_tables
+from temporal_awareness import create_temporal_tables
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -45,13 +46,20 @@ def ensure_database_ready():
         logger.error(f"❌ Database check failed: {schema_info.get('error', 'Unknown error')}")
         return False
     
-    # First ensure timestamp tables exist
+    # First ensure timestamp and temporal tables exist
     try:
         logger.info("🕐 Ensuring timestamp tables and columns exist...")
         create_timestamp_tables(db_path)
         logger.info("✅ Timestamp tables verified/created")
     except Exception as e:
         logger.warning(f"⚠️ Timestamp table creation warning: {e}")
+        
+    try:
+        logger.info("🧠 Ensuring temporal awareness tables exist...")
+        create_temporal_tables(db_path)
+        logger.info("✅ Temporal tables verified/created")
+    except Exception as e:
+        logger.warning(f"⚠️ Temporal table creation warning: {e}")
     
     if not schema_info.get("needs_migration", False):
         logger.info("✅ Database schema is up to date")

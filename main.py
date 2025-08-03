@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import re
+import asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -1760,7 +1761,7 @@ def get_or_create_tag(conn: sqlite3.Connection, tag_name: str) -> int:
     result = cursor.fetchone()
     
     if result:
-        return result["id"]
+        return result[0]
     
     # Create new custom tag
     cursor.execute("""
