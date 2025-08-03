@@ -87,9 +87,12 @@ def start_server():
         'uvicorn', 
         'main:app',
         '--host', host,
-        '--port', str(port),
-        '--reload' if os.getenv('ENVIRONMENT') == 'development' else '--no-reload'
+        '--port', str(port)
     ]
+    
+    # Add reload flag only in development
+    if os.getenv('ENVIRONMENT') == 'development':
+        cmd.append('--reload')
     
     logger.info(f"📡 Server command: {' '.join(cmd)}")
     
